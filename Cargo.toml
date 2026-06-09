@@ -1,0 +1,23 @@
+[package]
+name = "electronicmail"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+eframe = "0.34.3"
+egui = "0.34.3"
+imap = "2.4.1"
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "native-tls", "hostname"] }
+mail-parser = "0.11.3"
+native-tls = "0.2.18"
+oauth2 = { version = "5.0.0", features = ["reqwest", "reqwest-blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "default-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+scraper = "0.23"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+url = "2.5.8"
+webbrowser = "1.2.1"
