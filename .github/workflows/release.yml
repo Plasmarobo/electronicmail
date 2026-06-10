@@ -98,10 +98,9 @@ jobs:
           Terminal=false
           EOF
 
-          # No icon is committed, so generate a simple placeholder for the
-          # AppImage (required by the spec). ImageMagick ships on the runner.
-          convert -size 256x256 xc:'#2d73dc' -gravity center \
-            -pointsize 110 -fill white -annotate 0 'EM' electronicmail.png
+          # Convert the committed Windows icon into a PNG for the AppImage
+          # (the spec requires a PNG/SVG icon). ImageMagick ships on the runner.
+          convert "email.ico[0]" -resize 256x256 electronicmail.png
 
           # linuxdeploy bundles the binary's direct library dependencies; the
           # runner has no FUSE, so extract-and-run the AppImage tools instead.
