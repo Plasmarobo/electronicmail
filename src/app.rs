@@ -1,5 +1,6 @@
 //! egui front-end: account setup, inbox list, search bar and message view.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
 use chrono::{DateTime, Local};
@@ -43,6 +44,8 @@ pub struct App {
     view: ViewMode,
     /// Configured accounts (drives the switcher); empty until the first sync.
     accounts: Vec<worker::AccountInfo>,
+    /// Unread (non-spam) message count per account email, for the badges.
+    unread_counts: HashMap<String, i64>,
     /// Active mailbox scope: `None` = combined "All inboxes" view.
     scope: Option<String>,
     /// Hide already-read messages (the default view).
@@ -96,6 +99,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::fonts::install(&cc.egui_ctx);
+        apply_style(&cc.egui_ctx);
         let (cmd_tx, evt_rx) = worker::spawn(cc.egui_ctx.clone());
         Self {
             cmd_tx,
@@ -107,6 +111,7 @@ impl App {
             has_calendar: false,
             view: ViewMode::Mail,
             accounts: Vec::new(),
+            unread_counts: HashMap::new(),
             scope: None,
             unread_only: true,
             adding_account: false,
@@ -203,6 +208,7 @@ impl App {
                     }
                 }
                 Event::Messages(list) => self.messages = list,
+                Event::UnreadCounts(counts) => self.unread_counts = counts,
                 Event::SpamMessages(list) => {
                     self.spam_messages = list;
                     self.spam_loaded = true;
@@ -743,17 +749,22 @@ impl App {
         let accounts = self.accounts.clone();
         egui::Panel::left("accounts")
             .resizable(true)
-            .default_size(190.0)
+            .default_size(240.0)
             .show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 ui.strong("Mailboxes");
                 ui.separator();
 
                 let all_selected = self.scope.is_none();
-                if ui
-                    .selectable_label(all_selected, "\u{1F4E5}  All inboxes")
-                    .clicked()
-                    && !all_selected
+                let total_unread: i64 = self.unread_counts.values().sum();
+                if mailbox_row(
+                    ui,
+                    0,
+                    all_selected,
+                    "\u{1F4E5}  All inboxes",
+                    "All inboxes",
+                    total_unread,
+                ) && !all_selected
                 {
                     self.scope = None;
                     self.selected = None;
@@ -761,14 +772,17 @@ impl App {
                     self.send(Command::SelectScope(None));
                 }
 
-                ui.add_space(2.0);
-                for acc in &accounts {
+                for (i, acc) in accounts.iter().enumerate() {
                     let selected = self.scope.as_deref() == Some(acc.email.as_str());
-                    if ui
-                        .selectable_label(selected, acc.email.as_str())
-                        .on_hover_text(acc.email.as_str())
-                        .clicked()
-                        && !selected
+                    let count = self.unread_counts.get(&acc.email).copied().unwrap_or(0);
+                    if mailbox_row(
+                        ui,
+                        i + 1,
+                        selected,
+                        acc.email.as_str(),
+                        acc.email.as_str(),
+                        count,
+                    ) && !selected
                     {
                         self.scope = Some(acc.email.clone());
                         self.selected = None;
@@ -870,9 +884,10 @@ impl App {
                 let show_account = self.scope.is_none();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let mut to_open = None;
-                    for msg in &self.messages {
+                    for (i, msg) in self.messages.iter().enumerate() {
                         let selected = self.selected == Some(msg.uid);
-                        let response = render_list_item(ui, msg, selected, show_account);
+                        let response =
+                            render_list_item(ui, msg, selected, show_account, i % 2 == 1);
                         if response.clicked() {
                             to_open = Some(msg.uid);
                         }
@@ -913,9 +928,10 @@ impl App {
                 let show_account = self.scope.is_none();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let mut to_open = None;
-                    for msg in &self.spam_messages {
+                    for (i, msg) in self.spam_messages.iter().enumerate() {
                         let selected = self.selected == Some(msg.uid);
-                        let response = render_list_item(ui, msg, selected, show_account);
+                        let response =
+                            render_list_item(ui, msg, selected, show_account, i % 2 == 1);
                         if response.clicked() {
                             to_open = Some(msg.uid);
                         }
@@ -1271,16 +1287,130 @@ impl App {
     }
 }
 
+/// Bump the default text sizes up a touch and brighten body/widget text so the
+/// UI reads more comfortably than egui's compact defaults.
+fn apply_style(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+
+    let mut style = (*ctx.global_style()).clone();
+    style.text_styles = [
+        (
+            TextStyle::Small,
+            FontId::new(11.5, FontFamily::Proportional),
+        ),
+        (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(15.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Heading,
+            FontId::new(21.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(13.5, FontFamily::Monospace),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    // Brighten text across widget states (egui's dark defaults are fairly dim).
+    let w = &mut style.visuals.widgets;
+    w.noninteractive.fg_stroke.color = egui::Color32::from_gray(215);
+    w.inactive.fg_stroke.color = egui::Color32::from_gray(225);
+    w.hovered.fg_stroke.color = egui::Color32::from_gray(245);
+    w.active.fg_stroke.color = egui::Color32::WHITE;
+
+    ctx.set_global_style(style);
+}
+
+/// Background tint for alternating ("zebra") rows. Brighter than egui's
+/// `faint_bg_color` for clearer A/B contrast in the lists.
+fn zebra_fill(ui: &egui::Ui) -> egui::Color32 {
+    let dark = ui.visuals().dark_mode;
+    if dark {
+        egui::Color32::from_white_alpha(20)
+    } else {
+        egui::Color32::from_black_alpha(16)
+    }
+}
+
+/// Render one mailbox row in the left panel: a zebra-striped background, the
+/// label on the left, and an unread badge on the right. Returns `true` if the
+/// row was clicked.
+fn mailbox_row(
+    ui: &mut egui::Ui,
+    idx: usize,
+    selected: bool,
+    label: &str,
+    hover: &str,
+    count: i64,
+) -> bool {
+    let fill = if idx % 2 == 1 {
+        zebra_fill(ui)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // `horizontal` constrains the row to a single line's height; without
+            // it a bare right-to-left layout expands to the whole panel height.
+            ui.horizontal(|ui| {
+                let clicked = ui
+                    .selectable_label(selected, egui::RichText::new(label).size(16.0))
+                    .on_hover_text(hover)
+                    .clicked();
+                if count > 0 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        unread_badge(ui, count);
+                    });
+                }
+                clicked
+            })
+            .inner
+        })
+        .inner
+}
+
+/// Draw a small rounded count "bubble" (e.g. an unread badge) at the cursor.
+fn unread_badge(ui: &mut egui::Ui, count: i64) {
+    let label = if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    };
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(50, 115, 220))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(label)
+                    .color(egui::Color32::WHITE)
+                    .small()
+                    .strong(),
+            );
+        });
+}
+
 fn render_list_item(
     ui: &mut egui::Ui,
     msg: &EmailSummary,
     selected: bool,
     show_account: bool,
+    alt: bool,
 ) -> egui::Response {
     // A `Frame` sizes its fill and rect to the row's content, so the highlight
     // and the click target cover only this message — not the whole column.
+    // Alternate (odd) rows get a faint background for an A/B "zebra" stripe.
     let fill = if selected {
         ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+    } else if alt {
+        zebra_fill(ui)
     } else {
         egui::Color32::TRANSPARENT
     };
@@ -1292,8 +1422,9 @@ fn render_list_item(
             ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    // The From line is always bold so the sender stands out.
-                    ui.label(egui::RichText::new(msg.from_display()).strong());
+                    // Lay out the right-hand metadata first so it always keeps
+                    // its space, then let the (bold) From line fill what's left
+                    // and truncate with an ellipsis instead of overrunning it.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if msg.flagged {
                             ui.label("★");
@@ -1314,6 +1445,13 @@ fn render_list_item(
                             let tag = msg.account.split('@').next().unwrap_or(&msg.account);
                             ui.label(egui::RichText::new(tag).small().weak());
                         }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            // The From line is always bold so the sender stands out.
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(msg.from_display()).strong())
+                                    .truncate(),
+                            );
+                        });
                     });
                 });
                 let subject = if msg.subject.is_empty() {
@@ -1322,8 +1460,12 @@ fn render_list_item(
                     msg.subject.clone()
                 };
                 let subject = egui::RichText::new(subject);
-                ui.label(if msg.seen { subject } else { subject.strong() });
-                ui.label(egui::RichText::new(&msg.snippet).small().weak());
+                ui.add(
+                    egui::Label::new(if msg.seen { subject } else { subject.strong() }).truncate(),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&msg.snippet).small().weak()).truncate(),
+                );
             });
         })
         .response;

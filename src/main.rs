@@ -7,6 +7,7 @@ mod calendar;
 mod config;
 mod fonts;
 mod htmlview;
+mod idle;
 mod imap_client;
 mod model;
 mod search;

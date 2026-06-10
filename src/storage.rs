@@ -275,6 +275,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// Number of unread (non-spam) messages per account, keyed by account email.
+    /// Accounts with no unread mail are omitted.
+    pub fn unread_counts(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account, COUNT(*) FROM messages \
+             WHERE is_spam = 0 AND seen = 0 GROUP BY account",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+        Ok(rows)
+    }
+
     /// Execute a parsed search query. `account == None` searches all accounts.
     pub fn search(
         &self,

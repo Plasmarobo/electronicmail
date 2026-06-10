@@ -7,9 +7,10 @@
 //! account (keyed by email), a current view *scope* (`None` = all inboxes, or a
 //! single account), and an unread-only toggle.
 
-use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::config::{self, AccountConfig, AppConfig};
 use crate::imap_client::{self, Session};
@@ -22,6 +23,13 @@ use crate::{auth, autoconfig, calendar, imap_client as imap_mod, smtp_client};
 const INITIAL_FETCH: u32 = 50;
 const VIEW_LIMIT: i64 = 300;
 const CALENDAR_MAX: u32 = 50;
+
+/// Auto-fetch poll cadence: start at five minutes and, when a poll turns up no
+/// new mail, back off in five-minute steps up to half an hour. Any new mail (or
+/// a manual sync) snaps the interval back to the minimum.
+const POLL_MIN: Duration = Duration::from_secs(5 * 60);
+const POLL_MAX: Duration = Duration::from_secs(30 * 60);
+const POLL_STEP: Duration = Duration::from_secs(5 * 60);
 
 /// Which authentication flow the user chose in the wizard.
 pub enum AuthChoice {
@@ -71,6 +79,9 @@ pub enum Command {
         choice: AuthChoice,
     },
     Sync,
+    /// Internal: a background auto-fetch triggered by the poll timer (`None`,
+    /// all accounts) or an IMAP IDLE push (`Some(email)`, one account).
+    AutoSync(Option<String>),
     Search(String),
     OpenMessage(i64),
     SendMessage(Compose),
@@ -111,6 +122,9 @@ pub enum Event {
     },
     NotAuthenticated,
     Messages(Vec<EmailSummary>),
+    /// Unread (non-spam) message count per account email, for the mailbox
+    /// list badges. Accounts with zero unread are omitted.
+    UnreadCounts(HashMap<String, i64>),
     MessageBody(EmailBody),
     MessageSent,
     CalendarEvents(Vec<calendar::CalEvent>),
@@ -124,6 +138,9 @@ pub enum Event {
 pub fn spawn(ctx: egui::Context) -> (Sender<Command>, Receiver<Event>) {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
     let (evt_tx, evt_rx) = std::sync::mpsc::channel::<Event>();
+
+    // The worker keeps a sender so IDLE watcher threads can nudge it to sync.
+    let self_tx = cmd_tx.clone();
 
     thread::spawn(move || {
         let store = match config::database_path().and_then(|p| Store::open(&p)) {
@@ -145,6 +162,9 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Command>, Receiver<Event>) {
             unread_only: true,
             events: evt_tx,
             ctx,
+            cmd_tx: self_tx,
+            idle_accounts: HashSet::new(),
+            poll_interval: POLL_MIN,
         };
 
         worker.startup();
@@ -166,6 +186,13 @@ struct Worker {
     unread_only: bool,
     events: Sender<Event>,
     ctx: egui::Context,
+    /// A clone of the command sender, handed to IDLE watcher threads so they
+    /// can ask the worker to sync when the server reports new mail.
+    cmd_tx: Sender<Command>,
+    /// Accounts that already have an IMAP IDLE watcher running.
+    idle_accounts: HashSet<String>,
+    /// Current auto-fetch poll interval (adapts with mail volume).
+    poll_interval: Duration,
 }
 
 impl Worker {
@@ -253,7 +280,9 @@ impl Worker {
             }
             self.status(format!("Connecting {}…", account.email));
             match self.ensure_session(&account.email) {
-                Ok(()) => self.sync_account(&account.email),
+                Ok(()) => {
+                    self.sync_account(&account.email);
+                }
                 Err(e) => self.emit(Event::Error(format!(
                     "could not connect {}: {e:#}",
                     account.email
@@ -262,30 +291,79 @@ impl Worker {
         }
         self.current_messages();
         self.status("Up to date");
+        self.start_idle_watchers();
     }
 
     fn run(&mut self, rx: Receiver<Command>) {
-        while let Ok(cmd) = rx.recv() {
-            match cmd {
-                Command::Discover(email) => self.discover(email),
-                Command::Authenticate { email, choice } => self.authenticate(email, choice),
-                Command::Sync => self.sync_all(),
-                Command::Search(query) => self.search(query),
-                Command::OpenMessage(uid) => self.open_message(uid),
-                Command::SendMessage(compose) => self.send_message(compose),
-                Command::LoadCalendar => self.load_calendar(),
-                Command::CreateEvent(event) => self.create_event(event),
-                Command::LoadSpam => self.send_spam(),
-                Command::MarkSpam(uid) => self.mark_spam(uid, true),
-                Command::MarkNotSpam(uid) => self.mark_spam(uid, false),
-                Command::BlockSender(uid) => self.block_sender(uid, true),
-                Command::AllowSender(uid) => self.block_sender(uid, false),
-                Command::SelectScope(scope) => self.select_scope(scope),
-                Command::SetUnreadOnly(unread) => {
-                    self.unread_only = unread;
-                    self.current_messages();
+        let mut next_poll = Instant::now() + self.poll_interval;
+        loop {
+            let wait = next_poll.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(wait) {
+                Ok(cmd) => {
+                    // A manual sync or an IDLE-driven fetch resets the poll
+                    // clock so we don't immediately poll again on top of it.
+                    let reschedule = matches!(cmd, Command::Sync | Command::AutoSync(_));
+                    self.handle(cmd);
+                    if reschedule {
+                        next_poll = Instant::now() + self.poll_interval;
+                    }
                 }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.auto_sync(None);
+                    next_poll = Instant::now() + self.poll_interval;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+    }
+
+    fn handle(&mut self, cmd: Command) {
+        match cmd {
+            Command::Discover(email) => self.discover(email),
+            Command::Authenticate { email, choice } => self.authenticate(email, choice),
+            Command::Sync => self.sync_all(),
+            Command::AutoSync(which) => self.auto_sync(which),
+            Command::Search(query) => self.search(query),
+            Command::OpenMessage(uid) => self.open_message(uid),
+            Command::SendMessage(compose) => self.send_message(compose),
+            Command::LoadCalendar => self.load_calendar(),
+            Command::CreateEvent(event) => self.create_event(event),
+            Command::LoadSpam => self.send_spam(),
+            Command::MarkSpam(uid) => self.mark_spam(uid, true),
+            Command::MarkNotSpam(uid) => self.mark_spam(uid, false),
+            Command::BlockSender(uid) => self.block_sender(uid, true),
+            Command::AllowSender(uid) => self.block_sender(uid, false),
+            Command::SelectScope(scope) => self.select_scope(scope),
+            Command::SetUnreadOnly(unread) => {
+                self.unread_only = unread;
+                self.current_messages();
+            }
+        }
+    }
+
+    /// Background auto-fetch. Syncs one account (an IDLE push) or all of them
+    /// (the poll timer), refreshes the view when anything new arrives, and
+    /// adapts the poll interval: new mail snaps back to [`POLL_MIN`], an empty
+    /// poll backs off one [`POLL_STEP`] toward [`POLL_MAX`].
+    fn auto_sync(&mut self, which: Option<String>) {
+        let emails: Vec<String> = match which {
+            Some(email) => vec![email],
+            None => self.cfg.accounts.iter().map(|a| a.email.clone()).collect(),
+        };
+        if emails.is_empty() {
+            return;
+        }
+        let mut new_mail = 0usize;
+        for email in &emails {
+            new_mail += self.sync_account(email);
+        }
+        if new_mail > 0 {
+            self.poll_interval = POLL_MIN;
+            self.current_messages();
+            self.send_spam();
+            self.status(format!("{new_mail} new message(s)"));
+        } else {
+            self.poll_interval = (self.poll_interval + POLL_STEP).min(POLL_MAX);
         }
     }
 
@@ -410,6 +488,7 @@ impl Worker {
         });
         self.sync_account(&email);
         self.current_messages();
+        self.start_idle_watchers();
     }
 
     /// Make sure we have a live IMAP session for `email`, refreshing the access
@@ -473,21 +552,43 @@ impl Worker {
         self.status("Up to date");
     }
 
-    /// Fetch new mail for a single account and persist it.
-    fn sync_account(&mut self, email: &str) {
+    /// Start an IMAP IDLE watcher for every account that has credentials and
+    /// isn't already being watched, so new mail shows up without waiting for
+    /// the next poll. Servers without IDLE simply fall back to polling.
+    fn start_idle_watchers(&mut self) {
+        let accounts: Vec<AccountConfig> = self.cfg.accounts.clone();
+        for account in accounts {
+            if self.idle_accounts.contains(&account.email) {
+                continue;
+            }
+            let has_credentials = match account.auth_method {
+                config::AuthMethod::OAuthGoogle => account.refresh_token.is_some(),
+                config::AuthMethod::Password => account.password.is_some(),
+            };
+            if !has_credentials {
+                continue;
+            }
+            self.idle_accounts.insert(account.email.clone());
+            crate::idle::spawn(account, self.cmd_tx.clone(), self.ctx.clone());
+        }
+    }
+
+    /// Fetch new mail for a single account and persist it. Returns the number
+    /// of newly fetched messages.
+    fn sync_account(&mut self, email: &str) -> usize {
         let Some(account) = self.cfg.account(email).cloned() else {
-            return;
+            return 0;
         };
         if let Err(e) = self.ensure_session(email) {
             self.emit(Event::Error(format!("connect failed for {email}: {e:#}")));
-            return;
+            return 0;
         }
 
         let since = match self.store.max_uid(&account.email) {
             Ok(v) => v,
             Err(e) => {
                 self.emit(Event::Error(format!("db error: {e:#}")));
-                return;
+                return 0;
             }
         };
 
@@ -498,16 +599,18 @@ impl Worker {
                 // Session may be stale; drop it so the next sync reconnects.
                 self.sessions.remove(email);
                 self.emit(Event::Error(format!("fetch failed for {email}: {e:#}")));
-                return;
+                return 0;
             }
         };
 
+        let count = fetched.len();
         for mut m in fetched {
             self.classify(&account, &mut m);
             if let Err(e) = self.store.upsert(&m) {
                 self.emit(Event::Error(format!("store error: {e:#}")));
             }
         }
+        count
     }
 
     /// Run the spam classifier over a freshly fetched message, filling in its
@@ -561,6 +664,15 @@ impl Worker {
         {
             Ok(rows) => self.emit(Event::Messages(rows)),
             Err(e) => self.emit(Event::Error(format!("load error: {e:#}"))),
+        }
+        self.send_unread_counts();
+    }
+
+    /// Emit the per-account unread badge counts.
+    fn send_unread_counts(&self) {
+        match self.store.unread_counts() {
+            Ok(counts) => self.emit(Event::UnreadCounts(counts)),
+            Err(e) => self.emit(Event::Error(format!("unread count error: {e:#}"))),
         }
     }
 
@@ -664,6 +776,8 @@ impl Worker {
                     Ok(None) => {}
                     Err(e) => self.emit(Event::Status(format!("couldn't mark read: {e:#}"))),
                 }
+                // Reading a message lowers its account's unread badge.
+                self.send_unread_counts();
             }
             Ok(None) => self.emit(Event::Error("message body not found".into())),
             Err(e) => self.emit(Event::Error(format!("body load error: {e:#}"))),
