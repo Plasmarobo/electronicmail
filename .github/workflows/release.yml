@@ -56,7 +56,7 @@ jobs:
           sudo apt-get install -y \
             libssl-dev pkg-config \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev
+            libxkbcommon-dev imagemagick
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -116,8 +116,13 @@ jobs:
           EOF
 
           # Convert the committed Windows icon into a PNG for the AppImage
-          # (the spec requires a PNG/SVG icon). ImageMagick ships on the runner.
-          convert "email.ico[0]" -resize 256x256 electronicmail.png
+          # (the spec requires a PNG/SVG icon). ImageMagick is installed above;
+          # newer versions ship `magick` instead of the legacy `convert`.
+          if command -v magick >/dev/null 2>&1; then
+            magick "email.ico[0]" -resize 256x256 electronicmail.png
+          else
+            convert "email.ico[0]" -resize 256x256 electronicmail.png
+          fi
 
           # linuxdeploy bundles the binary's direct library dependencies; the
           # runner has no FUSE, so extract-and-run the AppImage tools instead.
