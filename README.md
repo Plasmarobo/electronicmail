@@ -223,17 +223,21 @@ Release:
 |----------|---------|
 | Windows (x86-64) | `electronicmail-windows-x86_64.zip` |
 | Linux (x86-64) | `electronicmail-linux-x86_64.tar.gz` |
+| Linux (x86-64, portable) | `electronicmail-linux-x86_64.AppImage` |
 | macOS (Apple silicon) | `electronicmail-macos-aarch64.tar.gz` |
+| macOS (Intel) | `electronicmail-macos-x86_64.tar.gz` |
 
 To cut a release, push a semver tag:
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Download the archive for your platform from the **Releases** page, extract it,
-and run the `electronicmail` binary.
+and run the `electronicmail` binary. On Linux the AppImage is a single
+self-contained file — `chmod +x electronicmail-linux-x86_64.AppImage` and run
+it directly.
 
 
 ## Where data lives

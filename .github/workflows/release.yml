@@ -26,10 +26,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bin: electronicmail
             archive: electronicmail-linux-x86_64.tar.gz
+            appimage: true
           - os: macos-latest
             target: aarch64-apple-darwin
             bin: electronicmail
             archive: electronicmail-macos-aarch64.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin: electronicmail
+            archive: electronicmail-macos-x86_64.tar.gz
     steps:
       - uses: actions/checkout@v4
 
@@ -71,6 +76,53 @@ jobs:
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
+
+      - name: Build AppImage
+        if: matrix.appimage
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Assemble a minimal AppDir around the freshly built binary.
+          APPDIR=AppDir
+          mkdir -p "$APPDIR/usr/bin"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$APPDIR/usr/bin/electronicmail"
+
+          cat > electronicmail.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=electronicmail
+          Comment=A lean, fast email client
+          Exec=electronicmail
+          Icon=electronicmail
+          Categories=Network;Email;Office;
+          Terminal=false
+          EOF
+
+          # No icon is committed, so generate a simple placeholder for the
+          # AppImage (required by the spec). ImageMagick ships on the runner.
+          convert -size 256x256 xc:'#2d73dc' -gravity center \
+            -pointsize 110 -fill white -annotate 0 'EM' electronicmail.png
+
+          # linuxdeploy bundles the binary's direct library dependencies; the
+          # runner has no FUSE, so extract-and-run the AppImage tools instead.
+          curl -L -o linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          ./linuxdeploy \
+            --appdir "$APPDIR" \
+            --executable "$APPDIR/usr/bin/electronicmail" \
+            --desktop-file electronicmail.desktop \
+            --icon-file electronicmail.png \
+            --output appimage
+          mv electronicmail-*.AppImage electronicmail-linux-x86_64.AppImage
+
+      - name: Upload AppImage artifact
+        if: matrix.appimage
+        uses: actions/upload-artifact@v4
+        with:
+          name: electronicmail-linux-x86_64.AppImage
+          path: electronicmail-linux-x86_64.AppImage
 
   release:
     name: Publish GitHub release
