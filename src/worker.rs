@@ -101,6 +101,10 @@ pub enum Command {
     SelectScope(Option<String>),
     /// Toggle whether already-read messages are hidden.
     SetUnreadOnly(bool),
+    /// Internal: the background update check found a newer release on GitHub.
+    UpdateFound(crate::update::ReleaseInfo),
+    /// Download the pending update and overwrite this executable.
+    InstallUpdate,
 }
 
 /// Messages from the worker back to the UI.
@@ -131,6 +135,13 @@ pub enum Event {
     CalendarEventCreated(calendar::CalEvent),
     /// Messages currently filtered as spam.
     SpamMessages(Vec<EmailSummary>),
+    /// A newer release is available on GitHub.
+    UpdateAvailable {
+        version: String,
+        notes: String,
+    },
+    /// The update was downloaded and installed; restart to apply it.
+    UpdateInstalled,
     Error(String),
 }
 
@@ -165,6 +176,7 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Command>, Receiver<Event>) {
             cmd_tx: self_tx,
             idle_accounts: HashSet::new(),
             poll_interval: POLL_MIN,
+            pending_update: None,
         };
 
         worker.startup();
@@ -193,6 +205,9 @@ struct Worker {
     idle_accounts: HashSet<String>,
     /// Current auto-fetch poll interval (adapts with mail volume).
     poll_interval: Duration,
+    /// A newer release discovered by the background update check, awaiting the
+    /// user's go-ahead to install.
+    pending_update: Option<crate::update::ReleaseInfo>,
 }
 
 impl Worker {
@@ -255,6 +270,10 @@ impl Worker {
     /// On launch, show any locally cached mail immediately, then restore a
     /// session for every account that has saved credentials.
     fn startup(&mut self) {
+        // Check GitHub for a newer release in the background; the result (if
+        // any) comes back as a `Command::UpdateFound`.
+        crate::update::spawn_check(self.cmd_tx.clone());
+
         if self.cfg.accounts.is_empty() {
             self.emit(Event::NotAuthenticated);
             return;
@@ -338,6 +357,8 @@ impl Worker {
                 self.unread_only = unread;
                 self.current_messages();
             }
+            Command::UpdateFound(release) => self.on_update_found(release),
+            Command::InstallUpdate => self.install_update(),
         }
     }
 
@@ -372,6 +393,30 @@ impl Worker {
         self.current_messages();
     }
 
+    /// Remember a release the background check found and tell the UI to offer it.
+    fn on_update_found(&mut self, release: crate::update::ReleaseInfo) {
+        self.emit(Event::UpdateAvailable {
+            version: release.version.clone(),
+            notes: release.notes.clone(),
+        });
+        self.pending_update = Some(release);
+    }
+
+    /// Download and apply the pending update, replacing this executable.
+    fn install_update(&mut self) {
+        let Some(release) = self.pending_update.clone() else {
+            return;
+        };
+        self.status(format!("Downloading update {}…", release.version));
+        match crate::update::install(&release) {
+            Ok(()) => {
+                self.pending_update = None;
+                self.status("Update installed — restart to apply");
+                self.emit(Event::UpdateInstalled);
+            }
+            Err(e) => self.emit(Event::Error(format!("Update failed: {e:#}"))),
+        }
+    }
     fn authenticate(&mut self, email: String, choice: AuthChoice) {
         match choice {
             AuthChoice::Google => self.authenticate_google(email),

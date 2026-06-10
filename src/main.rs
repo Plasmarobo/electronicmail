@@ -14,6 +14,7 @@ mod search;
 mod smtp_client;
 mod spam;
 mod storage;
+mod update;
 mod worker;
 
 fn load_icon() -> egui::IconData {

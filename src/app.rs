@@ -94,6 +94,18 @@ pub struct App {
     ev_date: String,
     ev_start_time: String,
     ev_duration_min: String,
+
+    // Self-update
+    /// Version string of an available update, once the check reports one.
+    update_version: Option<String>,
+    /// Markdown release notes for the available update.
+    update_notes: String,
+    /// Whether the update prompt window is currently shown.
+    show_update: bool,
+    /// True while the update is downloading/installing.
+    updating: bool,
+    /// True once the update has been written; the app must restart to apply it.
+    update_installed: bool,
 }
 
 impl App {
@@ -145,6 +157,11 @@ impl App {
             ev_date: String::new(),
             ev_start_time: "09:00".to_string(),
             ev_duration_min: "60".to_string(),
+            update_version: None,
+            update_notes: String::new(),
+            show_update: false,
+            updating: false,
+            update_installed: false,
         }
     }
 
@@ -213,6 +230,15 @@ impl App {
                     self.spam_messages = list;
                     self.spam_loaded = true;
                 }
+                Event::UpdateAvailable { version, notes } => {
+                    self.update_version = Some(version);
+                    self.update_notes = notes;
+                    self.show_update = true;
+                }
+                Event::UpdateInstalled => {
+                    self.updating = false;
+                    self.update_installed = true;
+                }
                 Event::MessageBody(body) => {
                     // Only display if it still matches the selected message.
                     if Some(body.uid) == self.selected {
@@ -241,6 +267,7 @@ impl App {
                 Event::Error(e) => {
                     self.error = Some(e);
                     self.sending = false;
+                    self.updating = false;
                     if self.wizard == WizardStep::Connecting {
                         self.wizard = match &self.discovered {
                             Some(s) if s.auth == crate::autoconfig::AuthKind::Password => {
@@ -265,6 +292,7 @@ impl eframe::App for App {
         self.drain_events();
 
         self.top_bar(ui);
+        self.update_window(ui.ctx());
 
         if self.authenticated && !self.adding_account {
             self.compose_window(ui.ctx());
@@ -373,6 +401,21 @@ impl App {
                 if self.authenticated {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(egui::RichText::new(self.active_email()).weak());
+                        if let Some(version) = self.update_version.clone() {
+                            let label = if self.update_installed {
+                                "⟳ Restart to update".to_string()
+                            } else {
+                                format!("⟱ Update to {version}")
+                            };
+                            if ui
+                                .button(egui::RichText::new(label).color(egui::Color32::from_rgb(
+                                    90, 170, 90,
+                                )))
+                                .clicked()
+                            {
+                                self.show_update = true;
+                            }
+                        }
                     });
                 }
             });
@@ -1068,6 +1111,79 @@ impl App {
 
     // --- Compose ---
 
+    fn update_window(&mut self, ctx: &egui::Context) {
+        if !self.show_update {
+            return;
+        }
+        let version = self.update_version.clone().unwrap_or_default();
+        let mut open = true;
+        egui::Window::new("Software update")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([460.0, 320.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.update_installed {
+                    ui.label(
+                        egui::RichText::new(format!("electronicmail {version} is installed."))
+                            .strong(),
+                    );
+                    ui.label("Restart the app to start using the new version.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Restart now").clicked() {
+                            restart_app();
+                        }
+                        if ui.button("Later").clicked() {
+                            self.show_update = false;
+                        }
+                    });
+                    return;
+                }
+
+                ui.label(
+                    egui::RichText::new(format!("electronicmail {version} is available."))
+                        .strong()
+                        .size(16.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("You're running {}.", env!("CARGO_PKG_VERSION")))
+                        .weak(),
+                );
+
+                if !self.update_notes.trim().is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Release notes").weak());
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.label(&self.update_notes);
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if self.updating {
+                        ui.spinner();
+                        ui.label("Downloading and installing…");
+                    } else {
+                        if ui.button("Update now").clicked() {
+                            self.updating = true;
+                            self.error = None;
+                            self.send(Command::InstallUpdate);
+                        }
+                        if ui.button("Later").clicked() {
+                            self.show_update = false;
+                        }
+                    }
+                });
+            });
+        // A window closed via its [x] dismisses the prompt (unless mid-install).
+        if !open && !self.updating {
+            self.show_update = false;
+        }
+    }
+
     fn compose_window(&mut self, ctx: &egui::Context) {
         let mut open = self.compose_open;
         egui::Window::new("New message")
@@ -1334,6 +1450,20 @@ fn zebra_fill(ui: &egui::Ui) -> egui::Color32 {
     } else {
         egui::Color32::from_black_alpha(16)
     }
+}
+
+/// Relaunch the (freshly updated) executable and exit the current process.
+///
+/// Inside an AppImage `current_exe()` points at the read-only mount, so we
+/// prefer the `$APPIMAGE` path that was just replaced.
+fn restart_app() {
+    let target = std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
+    if let Some(path) = target {
+        let _ = std::process::Command::new(path).spawn();
+    }
+    std::process::exit(0);
 }
 
 /// Render one mailbox row in the left panel: a zebra-striped background, the

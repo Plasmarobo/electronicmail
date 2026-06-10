@@ -22,6 +22,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: electronicmail.exe
             archive: electronicmail-windows-x86_64.zip
+            update_asset: electronicmail-windows-x86_64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: electronicmail
@@ -31,10 +32,12 @@ jobs:
             target: aarch64-apple-darwin
             bin: electronicmail
             archive: electronicmail-macos-aarch64.tar.gz
+            update_asset: electronicmail-macos-aarch64
           - os: macos-13
             target: x86_64-apple-darwin
             bin: electronicmail
             archive: electronicmail-macos-x86_64.tar.gz
+            update_asset: electronicmail-macos-x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -76,6 +79,20 @@ jobs:
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
+
+      # The in-app self-updater downloads a single raw binary (no archive to
+      # unpack). Linux uses the AppImage below as its update asset instead.
+      - name: Stage raw binary for self-update
+        if: matrix.update_asset
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.update_asset }}"
+
+      - name: Upload raw binary artifact
+        if: matrix.update_asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.update_asset }}
+          path: ${{ matrix.update_asset }}
 
       - name: Build AppImage
         if: matrix.appimage
