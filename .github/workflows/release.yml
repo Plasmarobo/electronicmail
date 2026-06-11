@@ -28,12 +28,15 @@ jobs:
             bin: electronicmail
             archive: electronicmail-linux-x86_64.tar.gz
             appimage: true
+          # Both macOS slices build on the arm64 runner: the Apple clang
+          # toolchain cross-compiles the x86_64 target from Apple Silicon, so we
+          # avoid the retired Intel runner images (macos-13) entirely.
           - os: macos-latest
             target: aarch64-apple-darwin
             bin: electronicmail
             archive: electronicmail-macos-aarch64.tar.gz
             update_asset: electronicmail-macos-aarch64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             bin: electronicmail
             archive: electronicmail-macos-x86_64.tar.gz
