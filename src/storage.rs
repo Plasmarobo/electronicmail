@@ -413,6 +413,33 @@ impl Store {
         Ok(res)
     }
 
+    /// Map of `imap_uid -> seen` for every stored message in an account. Used to
+    /// reconcile local read-state against the server's `\Seen` flags.
+    pub fn seen_map(&self, account: &str) -> Result<std::collections::HashMap<i64, bool>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT imap_uid, seen FROM messages WHERE account = ?1")?;
+        let rows = stmt.query_map(params![account], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let (uid, seen) = r?;
+            map.insert(uid, seen);
+        }
+        Ok(map)
+    }
+
+    /// Set the read-state of a message identified by its server IMAP UID (used
+    /// when pulling read/unread changes made on other devices into the DB).
+    pub fn set_seen_by_imap_uid(&self, account: &str, imap_uid: i64, seen: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET seen = ?1 WHERE account = ?2 AND imap_uid = ?3",
+            params![seen as i64, account, imap_uid],
+        )?;
+        Ok(())
+    }
+
     /// Update the spam verdict for a single message.
     pub fn set_spam(&self, uid: i64, is_spam: bool, score: f32, reasons: &str) -> Result<()> {
         self.conn.execute(

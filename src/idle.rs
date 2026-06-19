@@ -97,7 +97,8 @@ fn connect(account: &AccountConfig) -> anyhow::Result<Session> {
                 .refresh_token
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("not signed in"))?;
-            let tokens = auth::google_refresh(refresh)?;
+            let (client_id, client_secret) = account.effective_client();
+            let tokens = auth::refresh(&client_id, &client_secret, refresh)?;
             imap_client::connect(
                 &account.imap_host,
                 account.imap_port,

@@ -1,8 +1,9 @@
 //! Gmail OAuth2 using the loopback (installed-app) flow with PKCE.
 //!
-//! The OAuth client id/secret are **bundled into the binary** (see
-//! [`crate::autoconfig::oauth_clients`]) so the user never visits a developer
-//! console. We open the system browser, capture the redirect on
+//! The OAuth client id/secret are supplied **per account** ("bring your own
+//! client"): the setup wizard captures them from the user's own Google Cloud
+//! project, so no shared client — and no Google verification fee — is required.
+//! We open the system browser, capture the redirect on
 //! `http://127.0.0.1:<ephemeral-port>`, then exchange the code for tokens.
 
 use anyhow::{Context, Result, bail};
@@ -13,8 +14,6 @@ use oauth2::{
 };
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-
-use crate::autoconfig::oauth_clients;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -31,31 +30,46 @@ pub struct Tokens {
     pub refresh_token: Option<String>,
 }
 
-/// Error returned when no Google OAuth client was compiled into this build.
-fn require_google_client() -> Result<(&'static str, &'static str)> {
-    if !oauth_clients::google_configured() {
-        bail!(
-            "this build has no bundled Google sign-in. Rebuild with EM_GOOGLE_CLIENT_ID / \
-             EM_GOOGLE_CLIENT_SECRET set, or use an app-password instead."
-        );
+/// Extract `(client_id, client_secret)` from the JSON that Google's Cloud
+/// Console hands out when you download an OAuth client (the
+/// `client_secret_*.json` file). Handles both the desktop (`installed`) and
+/// web (`web`) wrappers, as well as a bare `{ "client_id", "client_secret" }`.
+pub fn parse_oauth_client_json(text: &str) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Client {
+        client_id: Option<String>,
+        client_secret: Option<String>,
     }
-    Ok((
-        oauth_clients::GOOGLE_CLIENT_ID,
-        oauth_clients::GOOGLE_CLIENT_SECRET,
-    ))
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        installed: Option<Client>,
+        web: Option<Client>,
+    }
+
+    let value = serde_json::from_str::<Wrapper>(text).ok()?;
+    let client = value.installed.or(value.web).or_else(|| {
+        // Fall back to a bare client object with no wrapper.
+        serde_json::from_str::<Client>(text).ok()
+    })?;
+    let id = client.client_id?;
+    let secret = client.client_secret?;
+    if id.trim().is_empty() || secret.trim().is_empty() {
+        return None;
+    }
+    Some((id.trim().to_string(), secret.trim().to_string()))
 }
 
-/// Interactive Google sign-in using the bundled client. The user only has to
-/// approve consent in the browser — no client id/secret required.
-pub fn google_login(open_browser: impl FnOnce(&str)) -> Result<Tokens> {
-    let (id, secret) = require_google_client()?;
-    interactive_login(id, secret, open_browser)
-}
-
-/// Refresh a Google access token using the bundled client.
-pub fn google_refresh(refresh_token: &str) -> Result<Tokens> {
-    let (id, secret) = require_google_client()?;
-    refresh(id, secret, refresh_token)
+/// Best-effort extraction of OAuth client credentials from arbitrary pasted
+/// text: a downloaded JSON blob, or a loose paste containing the client id and
+/// secret (e.g. copied straight from the console).
+pub fn parse_client_credentials(text: &str) -> Option<(String, String)> {
+    if let Some(pair) = parse_oauth_client_json(text) {
+        return Some(pair);
+    }
+    let tokens = || text.split(|c: char| c.is_whitespace() || "\"',{}[]:".contains(c));
+    let id = tokens().find(|t| t.ends_with(".apps.googleusercontent.com"))?;
+    let secret = tokens().find(|t| t.starts_with("GOCSPX-"))?;
+    Some((id.to_string(), secret.to_string()))
 }
 
 type ConfiguredClient = oauth2::Client<

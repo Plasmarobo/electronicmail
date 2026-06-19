@@ -1,0 +1,76 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Path to the Rust crate root (the parent of this `android/` directory).
+def rustRoot = rootProject.projectDir.parentFile
+
+android {
+    namespace 'com.electronicmail.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.electronicmail.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.3.0"
+
+        // Build a single ABI by default to keep the scaffold fast. Add
+        // 'armeabi-v7a' (older phones) or 'x86_64' (emulator) as needed.
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // The Rust cdylib (libelectronicmail.so) is emitted into jniLibs by the
+    // cargoNdkBuild task below, then packaged into the APK from here.
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ["${projectDir}/src/main/jniLibs"]
+        }
+    }
+}
+
+// --- Rust integration -------------------------------------------------------
+//
+// Cross-compiles the Rust core with cargo-ndk and drops the resulting
+// `libelectronicmail.so` straight into the jniLibs the APK packages, so a
+// normal Gradle build (or the Android Studio Run button) produces a full APK.
+//
+// One-time setup:
+//   rustup target add aarch64-linux-android
+//   cargo install cargo-ndk
+//   Install the Android NDK via the SDK Manager (Android Studio), then point
+//   ANDROID_NDK_HOME at it (cargo-ndk also auto-detects the SDK's NDK).
+//
+// cargo-ndk accepts the Gradle ABI names (e.g. arm64-v8a) directly via -t.
+tasks.register('cargoNdkBuild', Exec) {
+    description 'Cross-compiles the Rust core for Android via cargo-ndk.'
+    group 'build'
+    workingDir rustRoot
+
+    def cargoArgs = ['ndk']
+    android.defaultConfig.ndk.abiFilters.each { abi -> cargoArgs += ['-t', abi] }
+    cargoArgs += ['-o', "${projectDir}/src/main/jniLibs", 'build', '--lib']
+    if (gradle.startParameter.taskNames.any { it.toLowerCase().contains('release') }) {
+        cargoArgs += ['--release']
+    }
+
+    // `cargo` resolves from PATH on every platform (cargo.exe on Windows).
+    commandLine(['cargo'] + cargoArgs)
+}
+
+preBuild.dependsOn 'cargoNdkBuild'

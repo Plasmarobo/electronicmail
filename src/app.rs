@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
-
 use chrono::{DateTime, Local};
 
 use crate::model::{EmailBody, EmailSummary};
@@ -19,6 +18,8 @@ enum WizardStep {
     Password,
     /// Provider not recognised — collect server settings manually.
     Manual,
+    /// Gmail with a bring-your-own OAuth client — guided credential setup.
+    GoogleSetup,
     /// Authentication in progress (browser or IMAP login).
     Connecting,
 }
@@ -53,6 +54,14 @@ pub struct App {
     /// True while the setup wizard is being used to add an extra account.
     adding_account: bool,
 
+    /// Accounts whose mail is currently being synced in the foreground (on load
+    /// or a manual refresh). Drives the "Updating…" overlay. Background polls
+    /// are deliberately excluded so the overlay never flashes on its own.
+    syncing: std::collections::HashSet<String>,
+    /// Set when the user dismisses the sync overlay with its ✕; cleared the next
+    /// time a foreground sync starts.
+    sync_overlay_dismissed: bool,
+
     // Setup wizard
     wizard: WizardStep,
     /// Settings resolved from the email address (provider, hosts, auth kind).
@@ -64,6 +73,14 @@ pub struct App {
     form_smtp_port: String,
     form_username: String,
     form_password: String,
+    /// Bring-your-own-client OAuth credentials collected by the Google wizard.
+    form_client_id: String,
+    form_client_secret: String,
+    /// Scratch box for pasting the downloaded client JSON / id+secret.
+    form_client_paste: String,
+    /// True while the worker is watching the Downloads folder for a downloaded
+    /// OAuth client credentials file.
+    cred_watch_active: bool,
     /// Google consent URL surfaced by the worker so we can reopen it.
     auth_url: Option<String>,
     show_help: bool,
@@ -127,6 +144,8 @@ impl App {
             scope: None,
             unread_only: true,
             adding_account: false,
+            syncing: std::collections::HashSet::new(),
+            sync_overlay_dismissed: false,
             wizard: WizardStep::Email,
             discovered: None,
             form_email: String::new(),
@@ -136,6 +155,10 @@ impl App {
             form_smtp_port: "465".to_string(),
             form_username: String::new(),
             form_password: String::new(),
+            form_client_id: String::new(),
+            form_client_secret: String::new(),
+            form_client_paste: String::new(),
+            cred_watch_active: false,
             auth_url: None,
             show_help: false,
             search_text: String::new(),
@@ -205,6 +228,14 @@ impl App {
                         self.scope = Some(email);
                         self.adding_account = false;
                     }
+                    // Stop any credential watcher and wipe captured secrets.
+                    if self.cred_watch_active {
+                        self.send(Command::StopClientCredentialsWatch);
+                        self.cred_watch_active = false;
+                    }
+                    self.form_client_id.clear();
+                    self.form_client_secret.clear();
+                    self.form_client_paste.clear();
                     self.wizard = WizardStep::Email;
                 }
                 Event::NotAuthenticated => {
@@ -219,13 +250,21 @@ impl App {
                             Some(s) if s.auth == crate::autoconfig::AuthKind::Password => {
                                 WizardStep::Password
                             }
-                            Some(_) => WizardStep::Email,
+                            Some(_) => WizardStep::GoogleSetup,
                             None => WizardStep::Manual,
                         };
                     }
                 }
                 Event::Messages(list) => self.messages = list,
                 Event::UnreadCounts(counts) => self.unread_counts = counts,
+                Event::SyncStarted(email) => {
+                    self.syncing.insert(email);
+                    // A new foreground sync re-arms a previously dismissed overlay.
+                    self.sync_overlay_dismissed = false;
+                }
+                Event::SyncFinished(email) => {
+                    self.syncing.remove(&email);
+                }
                 Event::SpamMessages(list) => {
                     self.spam_messages = list;
                     self.spam_loaded = true;
@@ -238,6 +277,20 @@ impl App {
                 Event::UpdateInstalled => {
                     self.updating = false;
                     self.update_installed = true;
+                }
+                Event::ClientCredentialsDetected {
+                    client_id,
+                    client_secret,
+                } => {
+                    // Auto-captured a downloaded credentials file: fill the
+                    // form and go straight to the browser consent flow.
+                    if self.wizard == WizardStep::GoogleSetup {
+                        self.form_client_id = client_id;
+                        self.form_client_secret = client_secret;
+                        self.status =
+                            "Found your downloaded credentials — signing in…".to_string();
+                        self.start_google_auth();
+                    }
                 }
                 Event::MessageBody(body) => {
                     // Only display if it still matches the selected message.
@@ -273,7 +326,7 @@ impl App {
                             Some(s) if s.auth == crate::autoconfig::AuthKind::Password => {
                                 WizardStep::Password
                             }
-                            Some(_) => WizardStep::Email,
+                            Some(_) => WizardStep::GoogleSetup,
                             None => WizardStep::Manual,
                         };
                     }
@@ -460,6 +513,7 @@ impl App {
                     WizardStep::Discovering => self.wizard_discovering(ui),
                     WizardStep::Password => self.wizard_password(ui),
                     WizardStep::Manual => self.wizard_manual(ui),
+                    WizardStep::GoogleSetup => self.google_setup(ui),
                     WizardStep::Connecting => self.wizard_connecting(ui),
                 }
 
@@ -556,8 +610,17 @@ impl App {
 
         match auth {
             AuthKind::OAuthGoogle => {
-                // No password needed — go straight to the browser consent flow.
-                self.start_auth(AuthChoice::Google);
+                // If this build bundles an OAuth client, sign in seamlessly.
+                // Otherwise guide the user through bring-your-own-client setup.
+                if crate::autoconfig::oauth_clients::google_configured() {
+                    self.form_client_id =
+                        crate::autoconfig::oauth_clients::GOOGLE_CLIENT_ID.to_string();
+                    self.form_client_secret =
+                        crate::autoconfig::oauth_clients::GOOGLE_CLIENT_SECRET.to_string();
+                    self.start_google_auth();
+                } else {
+                    self.begin_google_setup();
+                }
             }
             AuthKind::Password => {
                 self.wizard = WizardStep::Password;
@@ -726,6 +789,198 @@ impl App {
             username,
             password: self.form_password.clone(),
         });
+    }
+
+    /// Enter the bring-your-own-client Google setup step and begin watching the
+    /// Downloads folder for the credentials file the user will download.
+    fn begin_google_setup(&mut self) {
+        self.error = None;
+        if !self.cred_watch_active {
+            self.send(Command::WatchClientCredentials);
+            self.cred_watch_active = true;
+        }
+        self.wizard = WizardStep::GoogleSetup;
+    }
+
+    /// Leave the Google setup step, stopping the credential watcher.
+    fn cancel_google_setup(&mut self) {
+        if self.cred_watch_active {
+            self.send(Command::StopClientCredentialsWatch);
+            self.cred_watch_active = false;
+        }
+        self.error = None;
+        self.wizard = WizardStep::Email;
+    }
+
+    /// Start Google OAuth with the credentials currently in the form.
+    fn start_google_auth(&mut self) {
+        if self.cred_watch_active {
+            self.send(Command::StopClientCredentialsWatch);
+            self.cred_watch_active = false;
+        }
+        let client_id = self.form_client_id.trim().to_string();
+        let client_secret = self.form_client_secret.trim().to_string();
+        self.start_auth(AuthChoice::Google {
+            client_id,
+            client_secret,
+        });
+    }
+
+    /// Step 3c — bring-your-own-client Google OAuth setup. Guides the user
+    /// through creating a free OAuth client in their own Google Cloud project,
+    /// then auto-captures the credentials they download and signs in.
+    fn google_setup(&mut self, ui: &mut egui::Ui) {
+        const URL_PROJECT: &str = "https://console.cloud.google.com/projectcreate";
+        const URL_GMAIL_API: &str =
+            "https://console.cloud.google.com/apis/library/gmail.googleapis.com";
+        const URL_CALENDAR_API: &str =
+            "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com";
+        const URL_CONSENT: &str = "https://console.cloud.google.com/auth/branding";
+        const URL_AUDIENCE: &str = "https://console.cloud.google.com/auth/audience";
+        const URL_CLIENTS: &str = "https://console.cloud.google.com/auth/clients/create?type=desktop";
+
+        ui.horizontal(|ui| {
+            if ui.button("← Back").clicked() {
+                self.cancel_google_setup();
+            }
+            ui.add_space(4.0);
+            ui.heading("Connect Gmail — free, no fees");
+        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(&self.form_email).weak());
+        ui.add_space(8.0);
+        ui.label(
+            "A one-time setup links Gmail using your own free Google Cloud OAuth \
+             client. Follow the steps — the app finishes automatically the moment \
+             you download your credentials file.",
+        );
+        ui.add_space(12.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Step 1 · Create a Google Cloud project");
+            if ui.button("Open Google Cloud → New project").clicked() {
+                let _ = webbrowser::open(URL_PROJECT);
+            }
+            ui.add_space(8.0);
+
+            ui.strong("Step 2 · Enable the APIs");
+            ui.horizontal(|ui| {
+                if ui.button("Enable Gmail API").clicked() {
+                    let _ = webbrowser::open(URL_GMAIL_API);
+                }
+                if ui.button("Enable Calendar API").clicked() {
+                    let _ = webbrowser::open(URL_CALENDAR_API);
+                }
+            });
+            ui.add_space(8.0);
+
+            ui.strong("Step 3 · Configure the consent screen");
+            ui.label(
+                egui::RichText::new("Choose “External”, then add your own email as a Test user.")
+                    .small()
+                    .weak(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Consent screen").clicked() {
+                    let _ = webbrowser::open(URL_CONSENT);
+                }
+                if ui.button("Add test user").clicked() {
+                    let _ = webbrowser::open(URL_AUDIENCE);
+                }
+            });
+            ui.add_space(8.0);
+
+            ui.strong("Step 4 · Create the OAuth client");
+            ui.label(
+                egui::RichText::new("Application type: “Desktop app”, then click Download JSON.")
+                    .small()
+                    .weak(),
+            );
+            if ui.button("Create OAuth client (Desktop app)").clicked() {
+                let _ = webbrowser::open(URL_CLIENTS);
+            }
+        });
+
+        ui.add_space(14.0);
+
+        let captured = !self.form_client_id.trim().is_empty()
+            && !self.form_client_secret.trim().is_empty();
+        ui.horizontal(|ui| {
+            if captured {
+                ui.colored_label(
+                    egui::Color32::from_rgb(80, 170, 90),
+                    "✔ Credentials captured",
+                );
+            } else {
+                ui.spinner();
+                ui.label("Watching your Downloads folder for the credentials file…");
+            }
+        });
+        ui.add_space(8.0);
+
+        egui::CollapsingHeader::new("Enter credentials manually").show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Paste the downloaded JSON, or the client ID and secret:")
+                    .small()
+                    .weak(),
+            );
+            let paste = ui.add(
+                egui::TextEdit::multiline(&mut self.form_client_paste)
+                    .desired_rows(3)
+                    .desired_width(440.0)
+                    .hint_text("Paste client_secret_*.json contents here"),
+            );
+            if paste.changed() {
+                if let Some((id, secret)) =
+                    crate::auth::parse_client_credentials(&self.form_client_paste)
+                {
+                    self.form_client_id = id;
+                    self.form_client_secret = secret;
+                }
+            }
+            egui::Grid::new("byoc_grid")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Client ID");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form_client_id)
+                            .desired_width(360.0)
+                            .hint_text("…apps.googleusercontent.com"),
+                    );
+                    ui.end_row();
+                    ui.label("Client secret");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form_client_secret)
+                            .password(true)
+                            .desired_width(360.0)
+                            .hint_text("GOCSPX-…"),
+                    );
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(14.0);
+        let ready = !self.form_client_id.trim().is_empty()
+            && !self.form_client_secret.trim().is_empty();
+        if ui
+            .add_enabled(
+                ready,
+                egui::Button::new("Connect with Google").min_size(egui::vec2(220.0, 32.0)),
+            )
+            .clicked()
+        {
+            self.start_google_auth();
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Your credentials stay on this device and use your own free Google \
+                 project, so there are no verification fees.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     /// Kick off authentication and move to the Connecting step.
@@ -902,6 +1157,7 @@ impl App {
             .resizable(true)
             .default_size(380.0)
             .show_inside(ui, |ui| {
+                let panel_rect = ui.max_rect();
                 ui.add_space(4.0);
                 let title = match &self.scope {
                     Some(e) => e.clone(),
@@ -940,6 +1196,8 @@ impl App {
                         self.select_message(uid);
                     }
                 });
+
+                self.sync_overlay(ui, panel_rect);
             });
     }
 
@@ -948,6 +1206,7 @@ impl App {
             .resizable(true)
             .default_size(380.0)
             .show_inside(ui, |ui| {
+                let panel_rect = ui.max_rect();
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.strong("Spam");
@@ -965,6 +1224,7 @@ impl App {
                 if self.spam_messages.is_empty() {
                     ui.add_space(12.0);
                     ui.label(egui::RichText::new("No spam — nice and tidy.").weak());
+                    self.sync_overlay(ui, panel_rect);
                     return;
                 }
 
@@ -984,7 +1244,69 @@ impl App {
                         self.select_message(uid);
                     }
                 });
+
+                self.sync_overlay(ui, panel_rect);
             });
+    }
+
+    /// Whether the currently viewed mailbox scope is mid-sync and the overlay
+    /// hasn't been dismissed. For "All inboxes" (`scope == None`) this is true
+    /// while *any* account is still updating.
+    fn is_scope_syncing(&self) -> bool {
+        if self.sync_overlay_dismissed || self.syncing.is_empty() {
+            return false;
+        }
+        match &self.scope {
+            Some(email) => self.syncing.contains(email),
+            None => true,
+        }
+    }
+
+    /// Draw the "Updating…" spinner overlay across `rect` when the current
+    /// mailbox is syncing. Includes a ✕ to dismiss it manually.
+    fn sync_overlay(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        if !self.is_scope_syncing() {
+            return;
+        }
+        // Animate the spinner even while the worker is busy on its own thread.
+        ui.ctx().request_repaint();
+
+        // Dim the panel behind the card.
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("sync_overlay_dim"),
+        ));
+        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(110));
+
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new("sync_overlay_card"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.center() - egui::vec2(110.0, 24.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(200.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.add_space(4.0);
+                        ui.strong("Updating…");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .button("✕")
+                                    .on_hover_text("Dismiss")
+                                    .clicked()
+                                {
+                                    dismiss = true;
+                                }
+                            },
+                        );
+                    });
+                });
+            });
+        if dismiss {
+            self.sync_overlay_dismissed = true;
+        }
     }
 
     fn message_view(&mut self, ui: &mut egui::Ui) {

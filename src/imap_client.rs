@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use mail_parser::{Address, MessageParser};
 use native_tls::TlsConnector;
+use std::collections::HashMap;
 use std::net::TcpStream;
 
 use crate::storage::StoredMessage;
@@ -121,6 +122,34 @@ pub fn mark_seen(session: &mut Session, imap_uid: i64) -> Result<()> {
         .uid_store(imap_uid.to_string(), "+FLAGS (\\Seen)")
         .context("setting \\Seen flag")?;
     Ok(())
+}
+
+/// Fetch the current `\Seen` state from the server for the messages we already
+/// store, returning a map of `imap_uid -> seen`. Only UID and FLAGS are
+/// requested (no bodies), so this is cheap. We fetch the whole UID range that
+/// spans the local messages and let the caller match against what it has.
+pub fn fetch_flags(session: &mut Session, uids: &[i64]) -> Result<HashMap<i64, bool>> {
+    let mut out = HashMap::new();
+    if uids.is_empty() {
+        return Ok(out);
+    }
+    session.select("INBOX").context("selecting INBOX")?;
+    let min = uids.iter().min().copied().unwrap_or(1);
+    let max = uids.iter().max().copied().unwrap_or(min);
+    let seq = format!("{min}:{max}");
+    let fetches = session
+        .uid_fetch(seq, "(UID FLAGS)")
+        .context("fetching flags")?;
+    for f in fetches.iter() {
+        if let Some(uid) = f.uid {
+            let seen = f
+                .flags()
+                .iter()
+                .any(|fl| matches!(fl, imap::types::Flag::Seen));
+            out.insert(uid as i64, seen);
+        }
+    }
+    Ok(out)
 }
 
 fn to_stored(

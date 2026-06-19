@@ -11,18 +11,20 @@
 //!      `https://autoconfig.<domain>/mail/config-v1.1.xml` and
 //!      `https://<domain>/.well-known/autoconfig/mail/config-v1.1.xml`.
 //!
-//! OAuth client credentials are **bundled into the binary** (see
-//! [`oauth_clients`]) so the user never creates a Google Cloud project or
-//! pastes a client id/secret. When no Google client is compiled in, Gmail
-//! gracefully falls back to an app-password flow.
+//! Gmail uses Google OAuth with a **bring-your-own-client** model: the setup
+//! wizard captures the user's own OAuth client id/secret, so no shared client
+//! (and no Google verification fee) is needed. A client may optionally be
+//! [`oauth_clients`] compiled in as a fallback for private builds.
 
 use anyhow::{Result, anyhow};
 
-/// Bundled OAuth client credentials.
+/// Optional bundled OAuth client credentials (fallback for private builds).
 ///
-/// These are injected at **compile time** from the `EM_GOOGLE_CLIENT_ID` /
-/// `EM_GOOGLE_CLIENT_SECRET` environment variables so real secrets stay out of
-/// source control:
+/// The primary path is bring-your-own-client: each account stores its own
+/// OAuth client id/secret captured by the setup wizard. For private/internal
+/// builds a client may still be injected at **compile time** from the
+/// `EM_GOOGLE_CLIENT_ID` / `EM_GOOGLE_CLIENT_SECRET` environment variables so
+/// real secrets stay out of source control:
 ///
 /// ```powershell
 /// $env:EM_GOOGLE_CLIENT_ID = "xxxx.apps.googleusercontent.com"
@@ -32,7 +34,7 @@ use anyhow::{Result, anyhow};
 ///
 /// A desktop OAuth "secret" is not truly confidential (Google's installed-app
 /// model assumes it can be extracted); PKCE is what actually protects the
-/// exchange. When these are empty the app offers an app-password path instead.
+/// exchange. When these are empty the wizard collects per-account credentials.
 pub mod oauth_clients {
     pub const GOOGLE_CLIENT_ID: &str = match option_env!("EM_GOOGLE_CLIENT_ID") {
         Some(v) => v,
@@ -134,30 +136,19 @@ pub fn discover(email: &str) -> Result<MailSettings> {
 
 /// Built-in settings for the most common providers (no network needed).
 fn builtin(domain: &str) -> Option<MailSettings> {
-    let gmail_hint = "Gmail blocks password sign-in unless you create an \
-                      app-password (requires 2-step verification).";
-    let gmail_help = "https://myaccount.google.com/apppasswords";
-
     let s = match domain {
-        "gmail.com" | "googlemail.com" => {
-            // Prefer seamless OAuth; fall back to app-password when no client
-            // is bundled into this build.
-            if oauth_clients::google_configured() {
-                MailSettings {
-                    provider_name: "Gmail".into(),
-                    imap_host: "imap.gmail.com".into(),
-                    imap_port: 993,
-                    smtp_host: "smtp.gmail.com".into(),
-                    smtp_port: 465,
-                    auth: AuthKind::OAuthGoogle,
-                    app_password_hint: None,
-                    help_url: None,
-                }
-            } else {
-                MailSettings::password("Gmail", "imap.gmail.com", 993, "smtp.gmail.com", 465)
-                    .with_hint(gmail_hint, gmail_help)
-            }
-        }
+        "gmail.com" | "googlemail.com" => MailSettings {
+            provider_name: "Gmail".into(),
+            imap_host: "imap.gmail.com".into(),
+            imap_port: 993,
+            smtp_host: "smtp.gmail.com".into(),
+            smtp_port: 465,
+            // Always offer Google OAuth; the user supplies their own OAuth
+            // client via the setup wizard ("bring your own client").
+            auth: AuthKind::OAuthGoogle,
+            app_password_hint: None,
+            help_url: None,
+        },
         "outlook.com" | "hotmail.com" | "live.com" | "msn.com" | "office365.com"
         | "passport.com" => MailSettings::password(
             "Outlook",
@@ -278,8 +269,7 @@ fn parse_autoconfig_xml(xml: &str) -> Option<MailSettings> {
     let smtp_port: u16 = inner(outgoing, "port")?.parse().ok()?;
 
     // We only support Google's OAuth flow; everything else uses a password.
-    let oauth_google = oauth_clients::google_configured()
-        && incoming.to_ascii_lowercase().contains("oauth2")
+    let oauth_google = incoming.to_ascii_lowercase().contains("oauth2")
         && imap_host.to_ascii_lowercase().contains("google");
 
     Some(MailSettings {
@@ -367,14 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn gmail_without_bundled_client_uses_app_password() {
-        // Tests run without EM_GOOGLE_CLIENT_ID set, so Gmail falls back.
-        if !oauth_clients::google_configured() {
-            let g = discover("user@gmail.com").unwrap();
-            assert_eq!(g.auth, AuthKind::Password);
-            assert_eq!(g.imap_host, "imap.gmail.com");
-            assert!(g.help_url.is_some());
-        }
+    fn gmail_uses_google_oauth() {
+        // Gmail always offers Google OAuth now (the user brings their own
+        // OAuth client through the setup wizard).
+        let g = discover("user@gmail.com").unwrap();
+        assert_eq!(g.auth, AuthKind::OAuthGoogle);
+        assert_eq!(g.imap_host, "imap.gmail.com");
     }
 
     #[test]

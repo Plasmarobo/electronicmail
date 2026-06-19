@@ -8,9 +8,11 @@
 //! single account), and an unread-only toggle.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{self, AccountConfig, AppConfig};
 use crate::imap_client::{self, Session};
@@ -33,8 +35,12 @@ const POLL_STEP: Duration = Duration::from_secs(5 * 60);
 
 /// Which authentication flow the user chose in the wizard.
 pub enum AuthChoice {
-    /// Seamless Google OAuth2 with the bundled client (browser loopback flow).
-    Google,
+    /// Google OAuth2 using the account's own ("bring your own client") OAuth
+    /// client id/secret via the browser loopback flow.
+    Google {
+        client_id: String,
+        client_secret: String,
+    },
     /// Plain IMAP password / app-password.
     Password {
         imap_host: String,
@@ -105,6 +111,11 @@ pub enum Command {
     UpdateFound(crate::update::ReleaseInfo),
     /// Download the pending update and overwrite this executable.
     InstallUpdate,
+    /// Start watching for downloaded OAuth client credentials (the wizard's
+    /// auto-capture: scans Downloads for a `client_secret_*.json` file).
+    WatchClientCredentials,
+    /// Stop the OAuth client credential watch.
+    StopClientCredentialsWatch,
 }
 
 /// Messages from the worker back to the UI.
@@ -130,6 +141,12 @@ pub enum Event {
     /// list badges. Accounts with zero unread are omitted.
     UnreadCounts(HashMap<String, i64>),
     MessageBody(EmailBody),
+    /// A foreground sync (on load or a manual refresh) started for an account.
+    /// Drives the "Updating…" overlay. Periodic background syncs do *not* emit
+    /// this so the overlay stays out of the way.
+    SyncStarted(String),
+    /// A foreground sync finished for an account (success or failure).
+    SyncFinished(String),
     MessageSent,
     CalendarEvents(Vec<calendar::CalEvent>),
     CalendarEventCreated(calendar::CalEvent),
@@ -142,6 +159,12 @@ pub enum Event {
     },
     /// The update was downloaded and installed; restart to apply it.
     UpdateInstalled,
+    /// OAuth client credentials were auto-detected from the user's Downloads
+    /// folder (the setup wizard's bring-your-own-client auto-capture).
+    ClientCredentialsDetected {
+        client_id: String,
+        client_secret: String,
+    },
     Error(String),
 }
 
@@ -177,6 +200,7 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Command>, Receiver<Event>) {
             idle_accounts: HashSet::new(),
             poll_interval: POLL_MIN,
             pending_update: None,
+            cred_watch: None,
         };
 
         worker.startup();
@@ -184,6 +208,38 @@ pub fn spawn(ctx: egui::Context) -> (Sender<Command>, Receiver<Event>) {
     });
 
     (cmd_tx, evt_rx)
+}
+
+/// Scan a directory for a recently-downloaded Google OAuth client JSON
+/// (`client_secret_*.json`) and return its `(client_id, client_secret)`. Picks
+/// the newest matching file modified at or after `since`.
+fn scan_for_client_credentials(
+    dir: &std::path::Path,
+    since: SystemTime,
+) -> Option<(String, String)> {
+    let mut newest: Option<(SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !(name.starts_with("client_secret") && name.ends_with(".json")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        // Skip implausibly large files — a real client JSON is tiny.
+        if meta.len() > 64 * 1024 {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified < since {
+            continue;
+        }
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+    let text = std::fs::read_to_string(newest?.1).ok()?;
+    auth::parse_oauth_client_json(&text)
 }
 
 struct Worker {
@@ -208,6 +264,8 @@ struct Worker {
     /// A newer release discovered by the background update check, awaiting the
     /// user's go-ahead to install.
     pending_update: Option<crate::update::ReleaseInfo>,
+    /// Stop flag for the background OAuth-credential Downloads watcher.
+    cred_watch: Option<Arc<AtomicBool>>,
 }
 
 impl Worker {
@@ -298,6 +356,7 @@ impl Worker {
                 continue;
             }
             self.status(format!("Connecting {}…", account.email));
+            self.emit(Event::SyncStarted(account.email.clone()));
             match self.ensure_session(&account.email) {
                 Ok(()) => {
                     self.sync_account(&account.email);
@@ -307,6 +366,7 @@ impl Worker {
                     account.email
                 ))),
             }
+            self.emit(Event::SyncFinished(account.email.clone()));
         }
         self.current_messages();
         self.status("Up to date");
@@ -359,6 +419,8 @@ impl Worker {
             }
             Command::UpdateFound(release) => self.on_update_found(release),
             Command::InstallUpdate => self.install_update(),
+            Command::WatchClientCredentials => self.watch_client_credentials(),
+            Command::StopClientCredentialsWatch => self.stop_client_credentials_watch(),
         }
     }
 
@@ -375,8 +437,11 @@ impl Worker {
             return;
         }
         let mut new_mail = 0usize;
+        let mut seen_changed = false;
         for email in &emails {
-            new_mail += self.sync_account(email);
+            let (count, changed) = self.sync_account(email);
+            new_mail += count;
+            seen_changed |= changed;
         }
         if new_mail > 0 {
             self.poll_interval = POLL_MIN;
@@ -385,12 +450,62 @@ impl Worker {
             self.status(format!("{new_mail} new message(s)"));
         } else {
             self.poll_interval = (self.poll_interval + POLL_STEP).min(POLL_MAX);
+            // Read-state may have changed on the server even with no new mail.
+            if seen_changed {
+                self.current_messages();
+            }
         }
     }
 
     fn select_scope(&mut self, scope: Option<String>) {
         self.scope = scope;
         self.current_messages();
+    }
+
+    /// Start (or restart) the background watcher that auto-captures the OAuth
+    /// client credentials the user downloads from the Google Cloud Console. It
+    /// scans the Downloads folder for a `client_secret_*.json` file and, on
+    /// finding a valid one, emits [`Event::ClientCredentialsDetected`].
+    fn watch_client_credentials(&mut self) {
+        self.stop_client_credentials_watch();
+
+        let Some(downloads) =
+            directories::UserDirs::new().and_then(|d| d.download_dir().map(|p| p.to_path_buf()))
+        else {
+            return;
+        };
+
+        let flag = Arc::new(AtomicBool::new(true));
+        self.cred_watch = Some(flag.clone());
+        let events = self.events.clone();
+        let ctx = self.ctx.clone();
+        // Accept files touched shortly before the watch began so a file the
+        // user grabbed moments earlier is still picked up.
+        let since = SystemTime::now() - Duration::from_secs(600);
+        let deadline = Instant::now() + Duration::from_secs(15 * 60);
+
+        thread::spawn(move || {
+            while flag.load(Ordering::Relaxed) && Instant::now() < deadline {
+                if let Some((client_id, client_secret)) =
+                    scan_for_client_credentials(&downloads, since)
+                {
+                    let _ = events.send(Event::ClientCredentialsDetected {
+                        client_id,
+                        client_secret,
+                    });
+                    ctx.request_repaint();
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    /// Signal the credential watcher (if any) to stop.
+    fn stop_client_credentials_watch(&mut self) {
+        if let Some(flag) = self.cred_watch.take() {
+            flag.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Remember a release the background check found and tell the UI to offer it.
@@ -419,7 +534,10 @@ impl Worker {
     }
     fn authenticate(&mut self, email: String, choice: AuthChoice) {
         match choice {
-            AuthChoice::Google => self.authenticate_google(email),
+            AuthChoice::Google {
+                client_id,
+                client_secret,
+            } => self.authenticate_google(email, client_id, client_secret),
             AuthChoice::Password {
                 imap_host,
                 imap_port,
@@ -445,13 +563,14 @@ impl Worker {
         }
     }
 
-    fn authenticate_google(&mut self, email: String) {
-        let mut account = AccountConfig::google(email.clone());
+    fn authenticate_google(&mut self, email: String, client_id: String, client_secret: String) {
+        let mut account =
+            AccountConfig::google_byoc(email.clone(), client_id.clone(), client_secret.clone());
         self.status("Opening your browser to sign in with Google…");
 
         let events = self.events.clone();
         let ctx = self.ctx.clone();
-        let tokens = match auth::google_login(|url| {
+        let tokens = match auth::interactive_login(&client_id, &client_secret, |url| {
             // Surface the URL so the UI can reopen it, then try to launch it.
             let _ = events.send(Event::AuthUrl(url.to_string()));
             ctx.request_repaint();
@@ -554,7 +673,8 @@ impl Worker {
                     .refresh_token
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("not signed in"))?;
-                let tokens = auth::google_refresh(&refresh_token)?;
+                let (client_id, client_secret) = account.effective_client();
+                let tokens = auth::refresh(&client_id, &client_secret, &refresh_token)?;
                 // Persist a rotated refresh token if Google issued one.
                 if tokens.refresh_token != account.refresh_token {
                     if let Some(acc) = self.cfg.account_mut(email) {
@@ -591,7 +711,9 @@ impl Worker {
         let emails: Vec<String> = self.cfg.accounts.iter().map(|a| a.email.clone()).collect();
         for email in emails {
             self.status(format!("Syncing {email}…"));
+            self.emit(Event::SyncStarted(email.clone()));
             self.sync_account(&email);
+            self.emit(Event::SyncFinished(email.clone()));
         }
         self.current_messages();
         self.status("Up to date");
@@ -618,22 +740,23 @@ impl Worker {
         }
     }
 
-    /// Fetch new mail for a single account and persist it. Returns the number
-    /// of newly fetched messages.
-    fn sync_account(&mut self, email: &str) -> usize {
+    /// Fetch new mail for a single account and persist it, then reconcile
+    /// read-state with the server. Returns the number of newly fetched messages
+    /// and whether any existing message's read-state changed.
+    fn sync_account(&mut self, email: &str) -> (usize, bool) {
         let Some(account) = self.cfg.account(email).cloned() else {
-            return 0;
+            return (0, false);
         };
         if let Err(e) = self.ensure_session(email) {
             self.emit(Event::Error(format!("connect failed for {email}: {e:#}")));
-            return 0;
+            return (0, false);
         }
 
         let since = match self.store.max_uid(&account.email) {
             Ok(v) => v,
             Err(e) => {
                 self.emit(Event::Error(format!("db error: {e:#}")));
-                return 0;
+                return (0, false);
             }
         };
 
@@ -644,7 +767,7 @@ impl Worker {
                 // Session may be stale; drop it so the next sync reconnects.
                 self.sessions.remove(email);
                 self.emit(Event::Error(format!("fetch failed for {email}: {e:#}")));
-                return 0;
+                return (0, false);
             }
         };
 
@@ -655,7 +778,58 @@ impl Worker {
                 self.emit(Event::Error(format!("store error: {e:#}")));
             }
         }
-        count
+
+        // Pull read/unread changes made on the server (e.g. another device).
+        let seen_changed = self.reconcile_seen(&account.email);
+        (count, seen_changed)
+    }
+
+    /// Pull the server's `\Seen` flags for messages we already store and apply
+    /// any differences to the local DB. Together with the immediate push when a
+    /// message is opened, this keeps read-state in sync bidirectionally so a
+    /// message read (or marked unread) on another device is reflected here.
+    /// Returns whether any local read-state actually changed.
+    fn reconcile_seen(&mut self, email: &str) -> bool {
+        let local = match self.store.seen_map(email) {
+            Ok(m) => m,
+            Err(e) => {
+                self.emit(Event::Error(format!("db error: {e:#}")));
+                return false;
+            }
+        };
+        if local.is_empty() {
+            return false;
+        }
+        let uids: Vec<i64> = local.keys().copied().collect();
+
+        // Scope the mutable session borrow so the DB writes below can borrow
+        // `self` again.
+        let server = {
+            let Some(session) = self.sessions.get_mut(email) else {
+                return false;
+            };
+            match imap_mod::fetch_flags(session, &uids) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.sessions.remove(email);
+                    self.emit(Event::Error(format!("flag sync failed for {email}: {e:#}")));
+                    return false;
+                }
+            }
+        };
+
+        let mut changed = false;
+        for (uid, &local_seen) in &local {
+            if let Some(&server_seen) = server.get(uid) {
+                if server_seen != local_seen {
+                    match self.store.set_seen_by_imap_uid(email, *uid, server_seen) {
+                        Ok(()) => changed = true,
+                        Err(e) => self.emit(Event::Error(format!("db error: {e:#}"))),
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// Run the spam classifier over a freshly fetched message, filling in its
@@ -842,7 +1016,8 @@ impl Worker {
             .refresh_token
             .clone()
             .ok_or_else(|| anyhow::anyhow!("not signed in with Google"))?;
-        let tokens = auth::google_refresh(&refresh_token)?;
+        let (client_id, client_secret) = account.effective_client();
+        let tokens = auth::refresh(&client_id, &client_secret, &refresh_token)?;
         if tokens.refresh_token != account.refresh_token {
             if let Some(acc) = self.cfg.account_mut(email) {
                 acc.refresh_token = tokens.refresh_token.clone();

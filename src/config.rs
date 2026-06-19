@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -129,10 +130,9 @@ fn default_smtp_port() -> u16 {
 }
 
 impl AccountConfig {
-    /// Build a Google OAuth2 account using the **bundled** client credentials,
-    /// filling in Gmail IMAP/SMTP defaults. The user supplies only their email.
-    pub fn google(email: String) -> Self {
-        use crate::autoconfig::oauth_clients;
+    /// Build a Google OAuth2 account from a user-supplied ("bring your own
+    /// client") OAuth client id/secret, filling in Gmail IMAP/SMTP defaults.
+    pub fn google_byoc(email: String, client_id: String, client_secret: String) -> Self {
         Self {
             email: email.clone(),
             imap_host: "imap.gmail.com".to_string(),
@@ -140,11 +140,26 @@ impl AccountConfig {
             smtp_host: "smtp.gmail.com".to_string(),
             smtp_port: 465,
             auth_method: AuthMethod::OAuthGoogle,
-            client_id: oauth_clients::GOOGLE_CLIENT_ID.to_string(),
-            client_secret: oauth_clients::GOOGLE_CLIENT_SECRET.to_string(),
+            client_id,
+            client_secret,
             refresh_token: None,
             username: email,
             password: None,
+        }
+    }
+
+    /// The OAuth client id/secret to use for this account: the per-account
+    /// ("bring your own client") values when set, else the optional bundled
+    /// compile-time client (kept for backwards compatibility).
+    pub fn effective_client(&self) -> (String, String) {
+        use crate::autoconfig::oauth_clients;
+        if !self.client_id.is_empty() && !self.client_secret.is_empty() {
+            (self.client_id.clone(), self.client_secret.clone())
+        } else {
+            (
+                oauth_clients::GOOGLE_CLIENT_ID.to_string(),
+                oauth_clients::GOOGLE_CLIENT_SECRET.to_string(),
+            )
         }
     }
 
@@ -179,13 +194,32 @@ fn project_dirs() -> Result<ProjectDirs> {
         .context("could not determine a config directory for this platform")
 }
 
+/// Optional runtime override for the base directory holding the config file and
+/// SQLite store. On Android the writable, app-private path is only known at
+/// runtime (from the `Activity`), so `android_main` installs it here before the
+/// app starts. When unset (desktop), platform defaults from `directories` win.
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the base directory for config + database. First call wins; later calls
+/// are ignored. Call before any [`config_path`] / [`database_path`] use.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
 pub fn config_path() -> Result<PathBuf> {
+    if let Some(base) = DATA_DIR.get() {
+        return Ok(base.join("config.toml"));
+    }
     let dirs = project_dirs()?;
     Ok(dirs.config_dir().join("config.toml"))
 }
 
 /// Path to the SQLite mail store.
 pub fn database_path() -> Result<PathBuf> {
+    if let Some(base) = DATA_DIR.get() {
+        return Ok(base.join("mail.db"));
+    }
     let dirs = project_dirs()?;
     Ok(dirs.data_dir().join("mail.db"))
 }

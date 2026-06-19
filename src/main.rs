@@ -1,47 +1,14 @@
-//! electronicmail — a lean, fast email client.
+//! electronicmail — desktop entry point.
+//!
+//! All application logic lives in the library crate (see `lib.rs`) so it can be
+//! shared with the Android build, which enters through `android_main` instead.
 
-mod app;
-mod auth;
-mod autoconfig;
-mod calendar;
-mod config;
-mod fonts;
-mod htmlview;
-mod idle;
-mod imap_client;
-mod model;
-mod search;
-mod smtp_client;
-mod spam;
-mod storage;
-mod update;
-mod worker;
-
-fn load_icon() -> egui::IconData {
-    let image = image::load_from_memory(include_bytes!("../email.ico"))
-        .expect("embedded email.ico is a valid image")
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    egui::IconData {
-        rgba: image.into_raw(),
-        width,
-        height,
-    }
-}
-
+#[cfg(not(target_os = "android"))]
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([720.0, 480.0])
-            .with_title("electronicmail")
-            .with_icon(load_icon()),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "electronicmail",
-        options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
-    )
+    electronicmail::run_desktop()
 }
+
+// On Android the entry point is `android_main` in the library crate; the binary
+// target is unused there, so `main` is just an empty stub.
+#[cfg(target_os = "android")]
+fn main() {}

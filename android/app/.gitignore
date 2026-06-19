@@ -1,0 +1,6 @@
+# Gradle build output.
+/build
+
+# Native libraries produced by `cargo ndk` (the cargoNdkBuild task) — these are
+# build artifacts, regenerated on every build.
+/src/main/jniLibs

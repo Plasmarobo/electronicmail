@@ -138,27 +138,39 @@ pub fn check() -> Result<Option<ReleaseInfo>> {
 /// [`self_replace::self_replace`], which performs the swap correctly on every
 /// platform (including renaming the busy executable on Windows).
 pub fn install(release: &ReleaseInfo) -> Result<()> {
-    let bytes = download(&release.download_url)?;
-
-    if let Some(appimage) = std::env::var_os("APPIMAGE") {
-        let target = PathBuf::from(appimage);
-        let tmp = target.with_extension("update-tmp");
-        std::fs::write(&tmp, &bytes)
-            .with_context(|| format!("writing update to {}", tmp.display()))?;
-        set_executable(&tmp)?;
-        std::fs::rename(&tmp, &target)
-            .with_context(|| format!("replacing {}", target.display()))?;
-        return Ok(());
+    // Android ships through the Play Store / an APK, not in-place binary swaps,
+    // so the self-updater is disabled there (and `platform_assets()` is empty).
+    #[cfg(target_os = "android")]
+    {
+        let _ = release;
+        anyhow::bail!("self-update is not supported on Android");
     }
 
-    let tmp = std::env::temp_dir().join(format!("electronicmail-update-{}", release.asset_name));
-    std::fs::write(&tmp, &bytes).with_context(|| format!("writing update to {}", tmp.display()))?;
-    set_executable(&tmp)?;
-    self_replace::self_replace(&tmp).context("replacing the running executable")?;
-    let _ = std::fs::remove_file(&tmp);
-    Ok(())
+    #[cfg(not(target_os = "android"))]
+    {
+        let bytes = download(&release.download_url)?;
+
+        if let Some(appimage) = std::env::var_os("APPIMAGE") {
+            let target = PathBuf::from(appimage);
+            let tmp = target.with_extension("update-tmp");
+            std::fs::write(&tmp, &bytes)
+                .with_context(|| format!("writing update to {}", tmp.display()))?;
+            set_executable(&tmp)?;
+            std::fs::rename(&tmp, &target)
+                .with_context(|| format!("replacing {}", target.display()))?;
+            return Ok(());
+        }
+
+        let tmp = std::env::temp_dir().join(format!("electronicmail-update-{}", release.asset_name));
+        std::fs::write(&tmp, &bytes).with_context(|| format!("writing update to {}", tmp.display()))?;
+        set_executable(&tmp)?;
+        self_replace::self_replace(&tmp).context("replacing the running executable")?;
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }
 
+#[cfg(not(target_os = "android"))]
 fn download(url: &str) -> Result<Vec<u8>> {
     let resp = http_client(Duration::from_secs(300))?
         .get(url)
@@ -176,6 +188,7 @@ fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client> {
 }
 
 /// Mark a freshly downloaded file as executable (no-op on Windows).
+#[cfg(not(target_os = "android"))]
 fn set_executable(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {

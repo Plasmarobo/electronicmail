@@ -1,13 +1,25 @@
 [package]
 name = "electronicmail"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2024"
+
+# The crate builds as both a regular library (linked by the desktop binary and
+# used in tests) and a C-ABI dynamic library (`libelectronicmail.so`) that the
+# Android `NativeActivity` loads and enters through `android_main`.
+[lib]
+name = "electronicmail"
+crate-type = ["lib", "cdylib"]
+
+# Desktop binary entry point. On Android this target is unused (the OS launches
+# the cdylib's `android_main` instead).
+[[bin]]
+name = "electronicmail"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
-eframe = "0.34.3"
 egui = "0.34.3"
 image = { version = "0.25", default-features = false, features = ["ico"] }
 imap = "2.4.1"
@@ -18,11 +30,31 @@ oauth2 = { version = "5.0.0", features = ["reqwest", "reqwest-blocking"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "default-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 scraper = "0.23"
-self-replace = "1.5"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 toml = "1.1.2"
 url = "2.5.8"
 webbrowser = "1.2.1"
+
+# --- Desktop-only dependencies ---
+# eframe pulls its full default feature set (accesskit, x11/wayland, glow).
+# self-replace performs the in-place binary swap for the self-updater, which is
+# meaningless on Android.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = "0.34.3"
+self-replace = "1.5"
+
+# --- Android-only dependencies ---
+# eframe must drop `accesskit` (incompatible with `android-native-activity`) and
+# the desktop windowing backends, keeping just the glow renderer + fonts.
+# winit gives us the `AndroidApp` handle + event-loop hook; android_logger pipes
+# `log` to logcat; the vendored OpenSSL builds native-tls for the NDK toolchain.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.34.3", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+winit = { version = "0.30", features = ["android-native-activity"] }
+android_logger = "0.14"
+log = "0.4"
+openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

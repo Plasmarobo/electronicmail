@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Fullscreen-ish, no action bar; uses framework styles so the app needs
+         no AppCompat/Material dependency (pairs with android:hasCode="false"). -->
+    <style name="Theme.ElectronicMail" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
+</resources>
