@@ -161,8 +161,10 @@ pub fn install(release: &ReleaseInfo) -> Result<()> {
             return Ok(());
         }
 
-        let tmp = std::env::temp_dir().join(format!("electronicmail-update-{}", release.asset_name));
-        std::fs::write(&tmp, &bytes).with_context(|| format!("writing update to {}", tmp.display()))?;
+        let tmp =
+            std::env::temp_dir().join(format!("electronicmail-update-{}", release.asset_name));
+        std::fs::write(&tmp, &bytes)
+            .with_context(|| format!("writing update to {}", tmp.display()))?;
         set_executable(&tmp)?;
         self_replace::self_replace(&tmp).context("replacing the running executable")?;
         let _ = std::fs::remove_file(&tmp);

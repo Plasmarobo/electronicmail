@@ -1,8 +1,8 @@
 //! egui front-end: account setup, inbox list, search bar and message view.
 
+use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
-use chrono::{DateTime, Local};
 
 use crate::model::{EmailBody, EmailSummary};
 use crate::worker::{self, AuthChoice, Command, Event};
@@ -287,8 +287,7 @@ impl App {
                     if self.wizard == WizardStep::GoogleSetup {
                         self.form_client_id = client_id;
                         self.form_client_secret = client_secret;
-                        self.status =
-                            "Found your downloaded credentials — signing in…".to_string();
+                        self.status = "Found your downloaded credentials — signing in…".to_string();
                         self.start_google_auth();
                     }
                 }
@@ -837,7 +836,8 @@ impl App {
             "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com";
         const URL_CONSENT: &str = "https://console.cloud.google.com/auth/branding";
         const URL_AUDIENCE: &str = "https://console.cloud.google.com/auth/audience";
-        const URL_CLIENTS: &str = "https://console.cloud.google.com/auth/clients/create?type=desktop";
+        const URL_CLIENTS: &str =
+            "https://console.cloud.google.com/auth/clients/create?type=desktop";
 
         ui.horizontal(|ui| {
             if ui.button("← Back").clicked() {
@@ -903,8 +903,8 @@ impl App {
 
         ui.add_space(14.0);
 
-        let captured = !self.form_client_id.trim().is_empty()
-            && !self.form_client_secret.trim().is_empty();
+        let captured =
+            !self.form_client_id.trim().is_empty() && !self.form_client_secret.trim().is_empty();
         ui.horizontal(|ui| {
             if captured {
                 ui.colored_label(
@@ -961,8 +961,8 @@ impl App {
         });
 
         ui.add_space(14.0);
-        let ready = !self.form_client_id.trim().is_empty()
-            && !self.form_client_secret.trim().is_empty();
+        let ready =
+            !self.form_client_id.trim().is_empty() && !self.form_client_secret.trim().is_empty();
         if ui
             .add_enabled(
                 ready,
@@ -1289,18 +1289,11 @@ impl App {
                         ui.add(egui::Spinner::new());
                         ui.add_space(4.0);
                         ui.strong("Updating…");
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .button("✕")
-                                    .on_hover_text("Dismiss")
-                                    .clicked()
-                                {
-                                    dismiss = true;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").on_hover_text("Dismiss").clicked() {
+                                dismiss = true;
+                            }
+                        });
                     });
                 });
             });
