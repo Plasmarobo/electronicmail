@@ -5,7 +5,7 @@
 //! any other port uses STARTTLS.
 
 use anyhow::{Context, Result};
-use lettre::message::{Mailbox, header::ContentType};
+use lettre::message::{Mailbox, MultiPart, header::ContentType};
 use lettre::transport::smtp::SmtpTransport;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{Message, Transport};
@@ -15,7 +15,11 @@ pub struct Outgoing {
     pub from: String,
     pub to: String,
     pub subject: String,
+    /// Plain-text body (also the fallback when an HTML part is present).
     pub body: String,
+    /// Optional rich `text/html` alternative rendered from the body's basic
+    /// formatting. When set, the message is sent as `multipart/alternative`.
+    pub body_html: Option<String>,
 }
 
 fn build_message(msg: &Outgoing) -> Result<Message> {
@@ -35,10 +39,20 @@ fn build_message(msg: &Outgoing) -> Result<Message> {
             .with_context(|| format!("invalid recipient address: {addr}"))?;
         builder = builder.to(mailbox);
     }
-    let message = builder
-        .header(ContentType::TEXT_PLAIN)
-        .body(msg.body.clone())
-        .context("building message")?;
+    let message = match &msg.body_html {
+        // A `multipart/alternative` carries both the plain text and the rich
+        // HTML so every client can pick what it can render.
+        Some(html) if !html.trim().is_empty() => builder
+            .multipart(MultiPart::alternative_plain_html(
+                msg.body.clone(),
+                html.clone(),
+            ))
+            .context("building message")?,
+        _ => builder
+            .header(ContentType::TEXT_PLAIN)
+            .body(msg.body.clone())
+            .context("building message")?,
+    };
     Ok(message)
 }
 

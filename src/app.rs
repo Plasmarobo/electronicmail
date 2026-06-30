@@ -97,6 +97,8 @@ pub struct App {
 
     // Compose
     compose_open: bool,
+    /// The chosen From address (selects which account a message is sent as).
+    compose_from: String,
     compose_to: String,
     compose_subject: String,
     compose_body: String,
@@ -168,6 +170,7 @@ impl App {
             selected: None,
             body: None,
             compose_open: false,
+            compose_from: String::new(),
             compose_to: String::new(),
             compose_subject: String::new(),
             compose_body: String::new(),
@@ -300,6 +303,7 @@ impl App {
                 Event::MessageSent => {
                     self.sending = false;
                     self.compose_open = false;
+                    self.compose_from.clear();
                     self.compose_to.clear();
                     self.compose_subject.clear();
                     self.compose_body.clear();
@@ -377,7 +381,7 @@ impl App {
                 if self.authenticated {
                     ui.separator();
                     if ui.button("✉ Compose").clicked() {
-                        self.compose_open = true;
+                        self.start_compose();
                     }
                     // Mail / Calendar view switch.
                     if ui
@@ -1354,6 +1358,12 @@ impl App {
                 });
 
             ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("↩ Reply").clicked() {
+                    self.start_reply(&msg);
+                }
+            });
+            ui.add_space(2.0);
             self.spam_controls(ui, &msg);
 
             ui.separator();
@@ -1499,19 +1509,76 @@ impl App {
         }
     }
 
+    /// Open the composer for a brand-new message from the active mailbox.
+    ///
+    /// Reuses the same window as a reply, but starts from a clean slate so no
+    /// leftover recipient, subject or quoted body carries over from a prior
+    /// reply draft.
+    fn start_compose(&mut self) {
+        self.compose_from = self.active_email().to_string();
+        self.compose_to.clear();
+        self.compose_subject.clear();
+        self.compose_body.clear();
+        self.error = None;
+        self.compose_open = true;
+    }
+
+    /// Pre-fill the composer with a reply to `msg`.
+    ///
+    /// The From address defaults to the account that *received* the message, so
+    /// the reply goes out from the same mailbox — but it stays editable so the
+    /// user can send from a different account.
+    fn start_reply(&mut self, msg: &EmailSummary) {
+        self.compose_from = if msg.account.is_empty() {
+            self.active_email().to_string()
+        } else {
+            msg.account.clone()
+        };
+        self.compose_to = msg.from_addr.clone();
+        self.compose_subject = reply_subject(&msg.subject);
+        self.compose_body = quote_reply(msg, self.body.as_ref());
+        self.error = None;
+        self.compose_open = true;
+    }
+
     fn compose_window(&mut self, ctx: &egui::Context) {
         let mut open = self.compose_open;
         egui::Window::new("New message")
             .open(&mut open)
             .resizable(true)
-            .default_size([520.0, 420.0])
+            .default_size([540.0, 460.0])
             .show(ctx, |ui| {
+                // Default the From address to the active mailbox.
+                if self.compose_from.is_empty() {
+                    self.compose_from = self.active_email().to_string();
+                }
+                let from_options: Vec<String> = if self.accounts.is_empty() {
+                    vec![self.active_email().to_string()]
+                } else {
+                    self.accounts.iter().map(|a| a.email.clone()).collect()
+                };
+
                 egui::Grid::new("compose_grid")
                     .num_columns(2)
                     .spacing([8.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("From");
-                        ui.label(egui::RichText::new(self.active_email()).weak());
+                        if from_options.len() > 1 {
+                            egui::ComboBox::from_id_salt("compose_from")
+                                .width(360.0)
+                                .selected_text(self.compose_from.clone())
+                                .show_ui(ui, |ui| {
+                                    for email in &from_options {
+                                        ui.selectable_value(
+                                            &mut self.compose_from,
+                                            email.clone(),
+                                            email.as_str(),
+                                        );
+                                    }
+                                });
+                        } else {
+                            ui.label(egui::RichText::new(&self.compose_from).weak());
+                        }
                         ui.end_row();
 
                         ui.label("To");
@@ -1531,12 +1598,59 @@ impl App {
                     });
 
                 ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.compose_body)
-                        .desired_rows(12)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Write your message…"),
-                );
+                // Formatting toolbar — each button rewrites the body's current
+                // selection (or inserts markers at the caret).
+                let body_id = egui::Id::new("compose_body_editor");
+                let sel = load_selection(ui.ctx(), body_id, self.compose_body.chars().count());
+                let mut refocus = false;
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("B").strong())
+                        .on_hover_text("Bold")
+                        .clicked()
+                    {
+                        let new = wrap_selection(&mut self.compose_body, sel, "**");
+                        store_selection(ui.ctx(), body_id, new);
+                        refocus = true;
+                    }
+                    if ui
+                        .button(egui::RichText::new("I").italics())
+                        .on_hover_text("Italic")
+                        .clicked()
+                    {
+                        let new = wrap_selection(&mut self.compose_body, sel, "*");
+                        store_selection(ui.ctx(), body_id, new);
+                        refocus = true;
+                    }
+                    if ui.button("• List").on_hover_text("Bulleted list").clicked() {
+                        let new = prefix_lines(&mut self.compose_body, sel, "- ");
+                        store_selection(ui.ctx(), body_id, new);
+                        refocus = true;
+                    }
+                    if ui.button("“ Quote").on_hover_text("Block quote").clicked() {
+                        let new = prefix_lines(&mut self.compose_body, sel, "> ");
+                        store_selection(ui.ctx(), body_id, new);
+                        refocus = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("Markdown: **bold**  *italic*")
+                                .weak()
+                                .small(),
+                        );
+                    });
+                });
+
+                ui.add_space(4.0);
+                let output = egui::TextEdit::multiline(&mut self.compose_body)
+                    .id(body_id)
+                    .desired_rows(12)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Write your message…")
+                    .show(ui);
+                if refocus {
+                    output.response.request_focus();
+                }
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -1545,6 +1659,7 @@ impl App {
                         self.sending = true;
                         self.error = None;
                         self.send(Command::SendMessage(worker::Compose {
+                            from: self.compose_from.clone(),
                             to: self.compose_to.trim().to_string(),
                             subject: self.compose_subject.clone(),
                             body: self.compose_body.clone(),
@@ -1840,6 +1955,112 @@ fn unread_badge(ui: &mut egui::Ui, count: i64) {
                     .strong(),
             );
         });
+}
+
+/// Build a "Re: …" subject, avoiding a doubled prefix on an existing reply.
+fn reply_subject(subject: &str) -> String {
+    let s = subject.trim();
+    let already = s
+        .get(..3)
+        .map(|p| p.eq_ignore_ascii_case("re:"))
+        .unwrap_or(false);
+    if already {
+        s.to_string()
+    } else if s.is_empty() {
+        "Re:".to_string()
+    } else {
+        format!("Re: {s}")
+    }
+}
+
+/// The quoted body for a reply: blank space to type in, an attribution line,
+/// then the original message text with each line prefixed by "> ".
+fn quote_reply(msg: &EmailSummary, body: Option<&EmailBody>) -> String {
+    let attribution = format!(
+        "On {}, {} wrote:",
+        format_date(msg.date_ts),
+        msg.from_display()
+    );
+    let original = body.and_then(|b| b.text.clone()).unwrap_or_default();
+    if original.trim().is_empty() {
+        return format!("\n\n{attribution}\n");
+    }
+    let quoted = original
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\n{attribution}\n{quoted}\n")
+}
+
+/// The body editor's current selection as a sorted char range, or the caret at
+/// `len` when the editor hasn't been focused yet.
+fn load_selection(ctx: &egui::Context, id: egui::Id, len: usize) -> (usize, usize) {
+    egui::TextEdit::load_state(ctx, id)
+        .and_then(|s| s.cursor.char_range())
+        .map(|r| {
+            let r = r.as_sorted_char_range();
+            (r.start, r.end)
+        })
+        .unwrap_or((len, len))
+}
+
+/// Persist a selection (char range) for the body editor so it stays visible
+/// after a toolbar edit reshapes the text.
+fn store_selection(ctx: &egui::Context, id: egui::Id, range: (usize, usize)) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(range.0),
+            egui::text::CCursor::new(range.1),
+        )));
+    egui::TextEdit::store_state(ctx, id, state);
+}
+
+/// Wrap the selected character range in `marker` (e.g. `**`), or drop an empty
+/// pair at the caret. Returns the new selection covering the inner text.
+fn wrap_selection(body: &mut String, sel: (usize, usize), marker: &str) -> (usize, usize) {
+    let (start, end) = sel;
+    let bs = char_to_byte(body, start);
+    let be = char_to_byte(body, end);
+    let inner = body[bs..be].to_string();
+    let replacement = format!("{marker}{inner}{marker}");
+    body.replace_range(bs..be, &replacement);
+    let m = marker.chars().count();
+    (start + m, end + m)
+}
+
+/// Prefix every line touched by the selection with `prefix` (lists/quotes).
+/// Returns the new selection spanning the affected lines.
+fn prefix_lines(body: &mut String, sel: (usize, usize), prefix: &str) -> (usize, usize) {
+    let chars: Vec<char> = body.chars().collect();
+    let (start, end) = sel;
+    let mut line_start = start.min(chars.len());
+    while line_start > 0 && chars[line_start - 1] != '\n' {
+        line_start -= 1;
+    }
+    let block_end = end.min(chars.len());
+    let block: String = chars[line_start..block_end].iter().collect();
+    let prefixed = block
+        .split('\n')
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bs = char_to_byte(body, line_start);
+    let be = char_to_byte(body, block_end);
+    let new_len = prefixed.chars().count();
+    body.replace_range(bs..be, &prefixed);
+    (line_start, line_start + new_len)
+}
+
+/// Byte offset of the `char_idx`-th character (or the string length when past
+/// the end), for slicing a `String` by char position.
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }
 
 fn render_list_item(

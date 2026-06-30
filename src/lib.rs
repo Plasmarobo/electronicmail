@@ -16,6 +16,7 @@ mod autoconfig;
 mod calendar;
 mod config;
 mod fonts;
+mod format;
 mod htmlview;
 mod idle;
 mod imap_client;

@@ -62,6 +62,8 @@ pub struct AccountInfo {
 
 /// Details for an outgoing message.
 pub struct Compose {
+    /// The address to send from; selects which account's credentials are used.
+    pub from: String,
     pub to: String,
     pub subject: String,
     pub body: String,
@@ -1028,16 +1030,25 @@ impl Worker {
     }
 
     fn send_message(&mut self, compose: Compose) {
-        let Some(account) = self.active_account() else {
+        // Send from the explicitly chosen address when it matches a configured
+        // account, otherwise fall back to the active account.
+        let account = self
+            .cfg
+            .account(&compose.from)
+            .cloned()
+            .or_else(|| self.active_account());
+        let Some(account) = account else {
             self.emit(Event::Error("no account configured".into()));
             return;
         };
         self.status("Sending…");
+        let body_html = crate::format::to_html(&compose.body);
         let outgoing = smtp_client::Outgoing {
             from: account.email.clone(),
             to: compose.to,
             subject: compose.subject,
             body: compose.body,
+            body_html: Some(body_html),
         };
 
         let result = match account.auth_method {
